@@ -50,45 +50,66 @@ class _FakeResponse:
         return self._body
 
 
-def _fake_session_factory(body, refreshed_value):
+def _cookie(name, value):
     from http.cookiejar import Cookie
 
+    # MFP sets refreshed cookies host-only on www, beside the seeded copy.
+    return Cookie(
+        0, name, value, None, False, "www.myfitnesspal.com", False, False, "/", True,
+        True, None, False, None, None, {},
+    )
+
+
+def _fake_session_factory(auth_ok=True, nextauth_ok=True):
     class _FakeSession:
         def __init__(self):
             self.cookies = None
 
         def get(self, url, headers=None, timeout=None):
-            # MFP sets the refreshed token host-only on www, beside the old one.
-            self.cookies.set_cookie(Cookie(
-                0, server.SESSION_COOKIE, refreshed_value, None, False,
-                "www.myfitnesspal.com", False, False, "/", True, True,
-                4_000_000_000, False, None, None, {},
-            ))
-            return _FakeResponse(200, body)
+            if "/user/auth_token" in url:
+                if not auth_ok:
+                    return _FakeResponse(401, {"error": "unauthorized"})
+                self.cookies.set_cookie(_cookie("_mfp_session", "rotated"))
+                return _FakeResponse(200, {"access_token": "a", "user_id": "1"})
+            if nextauth_ok:
+                self.cookies.set_cookie(_cookie(server.SESSION_COOKIE, "new"))
+                return _FakeResponse(200, {"userId": "1", "expires": "x"})
+            return _FakeResponse(200, {})
 
     return _FakeSession
 
 
-def test_refresh_session_saves_the_refreshed_token(monkeypatch, tmp_path):
-    import requests
-
+def _seed(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
     monkeypatch.setattr(server, "COOKIES_FILE", tmp_path / "cookies.json")
-    monkeypatch.setenv("MFP_COOKIES_JSON", json.dumps({server.SESSION_COOKIE: "old"}))
-    monkeypatch.setattr(
-        requests, "Session", _fake_session_factory({"userId": "1", "expires": "x"}, "new")
+    monkeypatch.setenv(
+        "MFP_COOKIES_JSON", json.dumps({server.SESSION_COOKIE: "old", "_mfp_session": "old"})
     )
-    server.refresh_session()
-    assert server.load_cookies() == {server.SESSION_COOKIE: "new"}
 
 
-def test_refresh_session_raises_on_dead_session(monkeypatch, tmp_path):
+def test_refresh_saves_rotated_cookies(monkeypatch, tmp_path):
     import requests
 
-    monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
-    monkeypatch.setattr(server, "COOKIES_FILE", tmp_path / "cookies.json")
-    monkeypatch.setenv("MFP_COOKIES_JSON", json.dumps({server.SESSION_COOKIE: "old"}))
-    monkeypatch.setattr(requests, "Session", _fake_session_factory({}, "new"))
-    with pytest.raises(RuntimeError, match="no longer valid"):
+    _seed(monkeypatch, tmp_path)
+    monkeypatch.setattr(requests, "Session", _fake_session_factory())
+    server.refresh_session()
+    assert server.load_cookies() == {server.SESSION_COOKIE: "new", "_mfp_session": "rotated"}
+
+
+def test_refresh_succeeds_without_nextauth(monkeypatch, tmp_path):
+    import requests
+
+    _seed(monkeypatch, tmp_path)
+    monkeypatch.setattr(requests, "Session", _fake_session_factory(nextauth_ok=False))
+    server.refresh_session()
+    assert server.load_cookies() == {server.SESSION_COOKIE: "old", "_mfp_session": "rotated"}
+
+
+def test_refresh_raises_and_saves_nothing_when_auth_token_fails(monkeypatch, tmp_path):
+    import requests
+
+    _seed(monkeypatch, tmp_path)
+    monkeypatch.setattr(requests, "Session", _fake_session_factory(auth_ok=False))
+    with pytest.raises(RuntimeError, match="no longer accepts"):
         server.refresh_session()
     assert not (tmp_path / "cookies.json").exists()

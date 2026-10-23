@@ -77,7 +77,7 @@ This MCP supports multiple authentication methods:
 | **Encrypted credentials (legacy)** | Add encrypted `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config; set `MFP_SECRET_KEY` outside the config (for example via shell env or OS keychain) | Form login no longer works against MFP's NextAuth backend — only useful if cached cookies are still valid |
 | **Plain credentials (legacy)** | Add `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config | Same as above — form login flow is deprecated |
 | **Browser cookies (browser_cookie3 fallback)** | Log into myfitnesspal.com in Chrome or Firefox via the default profile paths | Until browser session expires |
-| **Cookies in `MFP_COOKIES_JSON` (remote)** | Set the variable to the JSON from `scripts/export_cookies.py`. For hosts with no browser. | Renewed by the server indefinitely, if `MFP_STATE_DIR` is persistent (see [Session refresh](#session-refresh)) |
+| **Cookies in `MFP_COOKIES_JSON` (remote)** | Set the variable to the JSON from `scripts/export_cookies.py`. For hosts with no browser. | Renewed by the server while MFP accepts it (see [Session refresh](#session-refresh)) |
 
 > **Note**: MyFitnessPal migrated their authentication to NextAuth, so the
 > legacy form-POST `authenticate_with_credentials` path almost always fails
@@ -604,11 +604,15 @@ Local and Docker runs use your home IP. Some MFP endpoints behave differently fr
 
 ### Session refresh
 
-MFP's session cookie (`__Secure-next-auth.session-token`) is a NextAuth JWT that expires 30 days after it was issued. Each `GET /api/auth/session` returns a new one with a fresh 30 days, which is how a browser stays logged in. In HTTP mode the server does the same: a background thread calls it at startup and every 6 hours and saves the refreshed cookies to `$MFP_STATE_DIR/cookies.json`. With that directory on a Railway volume, the session survives restarts and redeploys and never lapses as long as the service runs.
+Tools authenticate through `/user/auth_token`, which trades cookies for the v2 API's bearer token. It accepts either of two cookie sets on its own: the legacy `_mfp_session` cookie, which MFP re-issues on every call, or the `remember_me` / `p` / `known_user` login cookies (`remember_me` lasts 30 days from login). It does not need the NextAuth session token (`__Secure-next-auth.session-token`).
+
+In HTTP mode a background thread runs at startup and every 6 hours. It calls `/user/auth_token` and saves every cookie MFP sends back, including the re-issued `_mfp_session`, to `$MFP_STATE_DIR/cookies.json`; with that directory on a Railway volume, the newest cookies survive restarts and redeploys. It also calls `/api/auth/session`, which renews the NextAuth token and `remember_me` for another 30 days while that NextAuth session is active.
+
+The NextAuth token cannot be relied on. An exported copy stopped working within a day (2026-10-22 export, rejected 2026-10-23) while Chrome's own session stayed valid, presumably because the browser kept using and renewing it. The server then logs `NextAuth session is not active, so only the legacy session was renewed`, which is expected. Whether the renewed `_mfp_session` keeps the session alive indefinitely depends on MFP's server-side expiry for it, which has not been observed yet. If not, access ends when `remember_me` expires, 30 days after the login that was exported.
 
 `MFP_COOKIES_JSON` only seeds the session. The saved file records a fingerprint of the variable it descends from, so setting a new export replaces the saved cookies; otherwise the saved (newer) ones win.
 
-Re-export only if the refresh fails. It logs `MFP session refresh failed` to Railway's logs, and tools return authentication errors. Possible causes, none observed so far: MFP revoking sessions (e.g. on a password change) or enforcing a maximum session age. To re-export, log into MFP in Chrome and rerun the `MFP_COOKIES_JSON` line; Railway redeploys on variable changes.
+When `/user/auth_token` stops accepting the session, the refresh logs `MFP session refresh failed` to Railway's logs and tools return authentication errors. Then log into MFP in Chrome and rerun the `MFP_COOKIES_JSON` line; Railway redeploys on variable changes.
 
 ## Troubleshooting
 

@@ -2488,14 +2488,19 @@ KEEPALIVE_INTERVAL = timedelta(hours=6)
 
 def refresh_session() -> None:
     """
-    Renew the MFP session and save the refreshed cookies.
+    Renew the MFP session and save every cookie MFP sends back.
 
-    The session token is a NextAuth JWT that expires 30 days after it was
-    issued. Each GET /api/auth/session returns a new one with a fresh 30
-    days, so calling this regularly keeps a session alive without a browser.
+    Tools authenticate through /user/auth_token, which accepts either the
+    legacy `_mfp_session` cookie (re-issued on each call) or the
+    `remember_me` login cookies; it does not need the NextAuth session token.
+    So this calls /user/auth_token, which is what fails when tools would, and
+    then /api/auth/session, which renews the NextAuth token and `remember_me`
+    for another 30 days while that session is active. A copy of the NextAuth
+    token goes stale once the browser it came from moves on, so its failure
+    is only a warning.
 
     Raises:
-        RuntimeError: If MFP no longer recognises the session
+        RuntimeError: If /user/auth_token no longer accepts the session
     """
     cookies = load_cookies()
     if not cookies:
@@ -2505,22 +2510,42 @@ def refresh_session() -> None:
     session = requests.Session()
     session.cookies = dict_to_cookiejar(cookies)
     response = session.get(
-        f"{MFP_WEB_BASE}/api/auth/session", headers=_web_headers(), timeout=30
+        f"{MFP_WEB_BASE}/user/auth_token?refresh=true", headers=_web_headers(), timeout=30
     )
-    body = response.json() if response.status_code == 200 else {}
-    if not body.get("userId"):
+    try:
+        authed = response.status_code == 200 and "access_token" in response.json()
+    except ValueError:
+        authed = False
+    if not authed:
         raise RuntimeError(
-            f"MFP session is no longer valid (HTTP {response.status_code}); "
+            f"MFP no longer accepts the session (auth_token HTTP {response.status_code}); "
             "re-export MFP_COOKIES_JSON"
         )
-    # The jar can hold the old cookie (domain .myfitnesspal.com) beside the
-    # refreshed one (www.myfitnesspal.com); keep the latest-expiring of each.
-    latest: Dict[str, Cookie] = {}
+
+    expires = None
+    try:
+        body = session.get(
+            f"{MFP_WEB_BASE}/api/auth/session", headers=_web_headers(), timeout=30
+        ).json()
+        expires = body.get("expires") if body.get("userId") else None
+    except Exception as e:
+        logger.warning(f"NextAuth session check failed: {e}")
+
+    # Seeded cookies sit on .myfitnesspal.com. A response either replaces one
+    # in place or sets a host-only copy on www.myfitnesspal.com, so where a
+    # name appears twice the copy on the other domain is the newer one.
+    latest: Dict[str, str] = {}
     for c in session.cookies:
-        if c.name not in latest or (c.expires or 0) > (latest[c.name].expires or 0):
-            latest[c.name] = c
-    save_cookies({name: c.value for name, c in latest.items()})
-    logger.info(f"Refreshed MFP session; it now expires {body.get('expires')}")
+        if c.name not in latest or c.domain != ".myfitnesspal.com":
+            latest[c.name] = c.value
+    save_cookies(latest)
+    if expires:
+        logger.info(f"Refreshed MFP session; NextAuth session now expires {expires}")
+    else:
+        logger.warning(
+            "Refreshed MFP session; NextAuth session is not active, so only the "
+            "legacy session was renewed"
+        )
 
 
 def _keepalive_loop(stop: "threading.Event") -> None:
