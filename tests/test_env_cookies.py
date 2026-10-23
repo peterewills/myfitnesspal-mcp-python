@@ -113,3 +113,47 @@ def test_refresh_raises_and_saves_nothing_when_auth_token_fails(monkeypatch, tmp
     with pytest.raises(RuntimeError, match="no longer accepts"):
         server.refresh_session()
     assert not (tmp_path / "cookies.json").exists()
+
+
+def test_keepalive_exits_after_repeated_failures(monkeypatch):
+    import threading
+
+    calls = []
+
+    def failing_refresh():
+        calls.append(1)
+        raise RuntimeError("dead")
+
+    def fake_exit(code):
+        raise SystemExit(code)
+
+    monkeypatch.setattr(server, "refresh_session", failing_refresh)
+    monkeypatch.setattr(server.os, "_exit", fake_exit)
+    stop = threading.Event()
+    monkeypatch.setattr(stop, "wait", lambda timeout: False)
+    with pytest.raises(SystemExit):
+        server._keepalive_loop(stop)
+    assert len(calls) == server.REFRESH_MAX_FAILURES
+
+
+def test_keepalive_resets_failures_after_a_success(monkeypatch):
+    import threading
+
+    outcomes = iter([False, False, True, False, False, True, "stop"])
+
+    def refresh():
+        if not next(outcomes):
+            raise RuntimeError("blip")
+
+    stop = threading.Event()
+    waits = []
+
+    def wait(timeout):
+        waits.append(timeout)
+        return len(waits) == 6
+
+    monkeypatch.setattr(server, "refresh_session", refresh)
+    monkeypatch.setattr(server.os, "_exit", lambda code: pytest.fail("exited"))
+    monkeypatch.setattr(stop, "wait", wait)
+    server._keepalive_loop(stop)
+    assert waits[2] == server.KEEPALIVE_INTERVAL.total_seconds()

@@ -612,7 +612,7 @@ The NextAuth token cannot be relied on. An exported copy stopped working within 
 
 `MFP_COOKIES_JSON` only seeds the session. The saved file records a fingerprint of the variable it descends from, so setting a new export replaces the saved cookies; otherwise the saved (newer) ones win.
 
-When `/user/auth_token` stops accepting the session, the refresh logs `MFP session refresh failed` to Railway's logs and tools return authentication errors. Then log into MFP in Chrome and rerun the `MFP_COOKIES_JSON` line; Railway redeploys on variable changes.
+When `/user/auth_token` stops accepting the session, every tool fails too, so the server stops: after 3 failed refreshes 10 minutes apart it logs `Exiting: the MFP session is dead` and exits. With the service's restart policy at `ON_FAILURE`, 1 retry (`railway api` mutation `serviceInstanceUpdate`, `restartPolicyMaxRetries: 1`), the deployment is marked crashed about 40 minutes after the session dies, which sends Railway's crash notification if one is enabled (Workspace → Settings → Notifications). To recover, log into MFP in Chrome and rerun the `MFP_COOKIES_JSON` line; Railway redeploys on variable changes.
 
 ## Troubleshooting
 

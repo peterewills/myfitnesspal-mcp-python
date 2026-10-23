@@ -2484,6 +2484,8 @@ async def favicon(request):
 
 SESSION_COOKIE = "__Secure-next-auth.session-token"
 KEEPALIVE_INTERVAL = timedelta(hours=6)
+REFRESH_RETRY_INTERVAL = timedelta(minutes=10)
+REFRESH_MAX_FAILURES = 3
 
 
 def refresh_session() -> None:
@@ -2549,12 +2551,30 @@ def refresh_session() -> None:
 
 
 def _keepalive_loop(stop: "threading.Event") -> None:
+    """Refresh the session every KEEPALIVE_INTERVAL; exit after repeated failure.
+
+    A failed refresh means /user/auth_token rejects the session, so every
+    tool is failing too. Exiting lets the host mark the deployment crashed
+    and send its crash notification; the retries ride out brief MFP outages.
+    """
+    failures = 0
     while True:
         try:
             refresh_session()
+            failures = 0
+            wait = KEEPALIVE_INTERVAL
         except Exception as e:
-            logger.error(f"MFP session refresh failed: {e}")
-        if stop.wait(KEEPALIVE_INTERVAL.total_seconds()):
+            failures += 1
+            logger.error(
+                f"MFP session refresh failed ({failures}/{REFRESH_MAX_FAILURES}): {e}"
+            )
+            if failures >= REFRESH_MAX_FAILURES:
+                logger.critical(
+                    "Exiting: the MFP session is dead. Re-export MFP_COOKIES_JSON."
+                )
+                os._exit(1)  # sys.exit would end only this thread
+            wait = REFRESH_RETRY_INTERVAL
+        if stop.wait(wait.total_seconds()):
             return
 
 
