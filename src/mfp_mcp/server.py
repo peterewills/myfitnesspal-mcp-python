@@ -15,6 +15,7 @@ Authentication Methods (in order of priority):
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -36,6 +37,7 @@ import keyring
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.types import Icon
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 # Configure logging to stderr (required for stdio transport)
@@ -46,8 +48,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mfp_mcp")
 
+# MyFitnessPal's app icon, shown by clients that render server icons
+ICON_PNG = (Path(__file__).parent / "icon.png").read_bytes()
+
 # Initialize MCP server
-mcp = FastMCP("myfitnesspal_mcp")
+mcp = FastMCP(
+    "myfitnesspal_mcp",
+    icons=[Icon(
+        src="data:image/png;base64," + base64.b64encode(ICON_PNG).decode(),
+        mimeType="image/png",
+        sizes=["180x180"],
+    )],
+    instructions=(
+        "Before logging a meal, read the day's diary with mfp_get_diary: the user may "
+        "have already logged it, and adding again double-counts.\n"
+        "Custom foods cannot be edited. To correct one, create the fixed version "
+        "with mfp_create_custom_food, then delete the old one with "
+        "mfp_delete_custom_food.\n"
+        "Custom-food carbs are NET carbs under the default country_code."
+    ),
+)
 
 # Configuration paths
 CONFIG_DIR = Path.home() / ".mfp_mcp"
@@ -92,11 +112,24 @@ def save_cookies(cookies: Dict[str, str]):
 
 def load_cookies() -> Optional[Dict[str, str]]:
     """
-    Load session cookies from file.
-    
+    Load session cookies from the MFP_COOKIES_JSON environment variable, else from file.
+
+    MFP_COOKIES_JSON (a JSON object of cookie name -> value) is how remote
+    deployments, which have no browser to read from, receive a session.
+
     Returns:
-        Dictionary of cookies if file exists and is valid, None otherwise
+        Dictionary of cookies if found and valid, None otherwise
     """
+    env_cookies = os.environ.get("MFP_COOKIES_JSON")
+    if env_cookies:
+        try:
+            cookies = json.loads(env_cookies)
+            if isinstance(cookies, dict) and cookies:
+                return cookies
+            logger.warning("MFP_COOKIES_JSON is not a non-empty JSON object; ignoring it")
+        except json.JSONDecodeError as e:
+            logger.warning(f"MFP_COOKIES_JSON is not valid JSON; ignoring it: {e}")
+
     if not COOKIES_FILE.exists():
         return None
     
@@ -1684,8 +1717,6 @@ def add_food_to_diary(
         f"x{quantity}) to {meal_name} for {target_date}"
     )
 
-    # MFP returns the new entry's id here and nowhere else - the diary page
-    # exposes only legacy numeric ids, which the v2 API does not accept.
     try:
         return response.json()["items"][0]["id"]
     except (ValueError, KeyError, IndexError):
@@ -1693,48 +1724,52 @@ def add_food_to_diary(
         return None
 
 
-def list_diary_entries(client, target_date: date) -> List[Dict[str, str]]:
+def list_diary_entries(client, target_date: date) -> List[Dict[str, Any]]:
     """
-    Scrape the diary page for the given date and return a list of entries
-    with their internal food_entry_id (needed for deletion), name, and meal.
+    List the day's food entries from the v2 diary API, including entries
+    logged in the MFP app or website.
 
     Returns:
-        List of {"entry_id", "name", "meal"} dicts in display order.
+        List of {"entry_id", "name", "brand", "meal", "servings", "unit",
+        "calories"} dicts in display order. `entry_id` is the v2 UUID that
+        `remove_diary_entry_v2` takes.
     """
-    import re
-
     date_str = target_date.strftime("%Y-%m-%d")
-    diary_url = f"{client.BASE_URL_SECURE}food/diary?date={date_str}"
-    # Use the library's session to ensure cookies/CSRF/etc. are aligned
-    response = client.session.get(diary_url)
-    src = response.text
-
-    entries: List[Dict[str, str]] = []
-    # Walk through the HTML linearly. Track the most recent meal header.
-    current_meal = None
-    pattern = re.compile(
-        r'(class="meal_header"[^>]*>\s*<[^>]+>([^<]+)</[^>]+>)|'
-        r'(<a[^>]+data-food-entry-id="(\d+)"[^>]+class="js-show-edit-food"[^>]*>'
-        r'([^<]+)</a>)',
-        re.DOTALL,
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/diary",
+        params={"entry_date": date_str, "types": "food_entry"},
+        headers=_mfp_api_headers(client),
+        timeout=30,
     )
-    for m in pattern.finditer(src):
-        if m.group(2):
-            current_meal = m.group(2).strip()
-        elif m.group(4):
-            entries.append({
-                "entry_id": m.group(4),
-                "name": m.group(5).strip(),
-                "meal": current_meal or "",
-            })
-    return entries
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Could not list diary entries for {date_str}: HTTP {response.status_code}"
+        )
+    items = [
+        i for i in response.json().get("items") or []
+        if i.get("type") == "food_entry" and not i.get("deleted")
+    ]
+    items.sort(key=lambda i: (VALID_MEALS.index(i["meal_name"])
+                              if i.get("meal_name") in VALID_MEALS else len(VALID_MEALS),
+                              i.get("meal_position", 0)))
+    return [
+        {
+            "entry_id": i["id"],
+            "name": (i.get("food") or {}).get("description", ""),
+            "brand": (i.get("food") or {}).get("brand_name"),
+            "meal": i.get("meal_name", ""),
+            "servings": i.get("servings"),
+            "unit": (i.get("serving_size") or {}).get("unit"),
+            "calories": ((i.get("nutritional_contents") or {}).get("energy") or {}).get("value"),
+        }
+        for i in items
+    ]
 
 
 def remove_diary_entry_v2(client, entry_id: str) -> None:
     """
     Delete a food diary entry by the UUID the v2 diary API assigned it
-    (what `add_food_to_diary` returns - a different id space than the
-    legacy numeric `food_entry_id` used by `remove_food_entry`).
+    (what `add_food_to_diary` returns and `list_diary_entries` lists).
     """
     response = client.session.delete(
         f"{MFP_API_BASE}/v2/diary/{entry_id}",
@@ -1742,49 +1777,6 @@ def remove_diary_entry_v2(client, entry_id: str) -> None:
         timeout=30,
     )
     if response.status_code in (200, 204):
-        logger.info(f"Removed diary entry {entry_id}")
-        return
-    raise RuntimeError(
-        f"Remove failed for entry {entry_id}: HTTP {response.status_code}"
-    )
-
-
-def remove_food_entry(client, entry_id: str) -> None:
-    """
-    Delete a food diary entry by its legacy numeric food_entry_id, as
-    returned by `list_diary_entries` (see `remove_diary_entry_v2` for the
-    v2 UUID case).
-
-    Uses the legacy /food/remove/{id} endpoint with X-CSRF-Token from
-    the diary page meta tag.
-    """
-    import re
-
-    # Need a fresh CSRF token from the diary page
-    diary_resp = client.session.get(
-        f"{client.BASE_URL_SECURE}food/diary"
-    )
-    csrf_match = re.search(
-        r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']',
-        diary_resp.text,
-    )
-    if not csrf_match:
-        raise RuntimeError("Could not extract csrf-token from diary page")
-    csrf = csrf_match.group(1)
-
-    response = client.session.request(
-        "DELETE",
-        f"{client.BASE_URL_SECURE}food/remove/{entry_id}",
-        headers={
-            "Referer": f"{client.BASE_URL_SECURE}food/diary",
-            "X-CSRF-Token": csrf,
-            "X-Requested-With": "XMLHttpRequest",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-        },
-        allow_redirects=False,
-    )
-    # Success = 302 redirect to diary, or 200 with empty body
-    if response.status_code in (200, 204, 302, 303):
         logger.info(f"Removed diary entry {entry_id}")
         return
     raise RuntimeError(
@@ -1869,6 +1861,15 @@ def set_water_intake(client, target_date: date, cups: float) -> None:
 # ============================================================================
 
 
+def _claim_entry_id(v2_entries: List[Dict[str, Any]], meal: str, name: str) -> Optional[str]:
+    """Pop and return the id of the first v2 entry in `meal` whose food
+    description starts the scraped entry name, or None if none matches."""
+    for i, e in enumerate(v2_entries):
+        if e["meal"].lower() == meal.lower() and name.lower().startswith(e["name"].lower()):
+            return v2_entries.pop(i)["entry_id"]
+    return None
+
+
 @mcp.tool(
     name="mfp_get_diary",
     annotations={
@@ -1884,7 +1885,7 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
     Get the food diary for a specific date including all meals and their nutritional information.
 
     Returns meals (Breakfast, Lunch, Dinner, Snacks) with each food entry's name,
-    quantity, and complete nutrition breakdown (calories, protein, carbs, fat, etc.).
+    entry_id (for mfp_remove_food_from_diary), quantity, and complete nutrition breakdown (calories, protein, carbs, fat, etc.).
     Also includes daily totals and goals.
 
     Args:
@@ -1910,10 +1911,20 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
             "notes": day.notes or "",
         }
 
+        try:
+            v2_entries = list_diary_entries(client, target_date)
+        except Exception as e:
+            logger.warning(f"Could not fetch entry ids for {target_date}: {e}")
+            v2_entries = []
+
         # Process meals
         for meal in day.meals:
             meal_data = {
-                "entries": [format_meal_entry(entry) for entry in meal.entries],
+                "entries": [
+                    {**format_meal_entry(entry),
+                     "entry_id": _claim_entry_id(v2_entries, meal.name, entry.name)}
+                    for entry in meal.entries
+                ],
                 "totals": format_nutrition_dict(meal.totals),
             }
             data["meals"][meal.name] = meal_data
@@ -2585,6 +2596,13 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             unit=params.unit,
         )
 
+        logged_ids = {e["entry_id"] for e in list_diary_entries(client, target_date)}
+        if entry_id not in logged_ids:
+            raise RuntimeError(
+                f"MyFitnessPal accepted the add but entry {entry_id} is not in the "
+                f"{target_date} diary"
+            )
+
         try:
             food_name = get_food_v2(client, params.mfp_id).get("description", "Food item")
         except Exception:
@@ -2593,6 +2611,7 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         return json.dumps(
             {
                 "success": True,
+                "verified": True,
                 "message": f"Successfully added {food_name} to {meal}",
                 "entry_id": entry_id,
                 "date": str(target_date),
@@ -2607,6 +2626,16 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         
     except Exception as e:
         return f"Error adding food to diary: {str(e)}"
+
+
+def _verify_removed(client, target_date: date, entry_ids: List[str]) -> None:
+    remaining = {e["entry_id"] for e in list_diary_entries(client, target_date)}
+    still_there = [i for i in entry_ids if i in remaining]
+    if still_there:
+        raise RuntimeError(
+            f"MyFitnessPal accepted the delete but these entries are still in the "
+            f"diary: {', '.join(still_there)}"
+        )
 
 
 @mcp.tool(
@@ -2626,8 +2655,8 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
     Two modes:
 
     1. By entry_id (precise): delete exactly the entry whose id matches -
-       this is the UUID `mfp_add_food_to_diary` returned when you logged it.
-       Use this when you already know the ID.
+       this is the UUID shown by `mfp_get_diary` or returned by
+       `mfp_add_food_to_diary`. Works for entries logged anywhere.
 
     2. By name_contains (fuzzy): list the day's entries, find ones whose
        name contains the given substring (case-insensitive), optionally
@@ -2635,12 +2664,14 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
 
     Args:
         params: RemoveFoodFromDiaryInput with one of:
-            - entry_id: the entry's UUID, as returned by
-              mfp_add_food_to_diary (NOT a food_entry_id from the diary page)
+            - entry_id: the entry's UUID, as listed by mfp_get_diary or
+              returned by mfp_add_food_to_diary
             - name_contains: substring match against entry names
             - meal: restrict matching to one meal
             - max_matches: safety cap for fuzzy matches (default 1)
             - date: date to operate on (default today)
+
+    Re-reads the diary afterwards and fails if any entry is still present.
 
     Returns:
         JSON describing each entry that was removed.
@@ -2649,11 +2680,13 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
         client = get_mfp_client()
         target_date = parse_date(params.date)
 
-        # Mode 1: delete a single entry by its v2 UUID (what add returns)
+        # Mode 1: delete a single entry by its v2 UUID
         if params.entry_id:
             remove_diary_entry_v2(client, params.entry_id)
+            _verify_removed(client, target_date, [params.entry_id])
             return json.dumps({
                 "success": True,
+                "verified": True,
                 "removed": [{"entry_id": params.entry_id}],
                 "date": str(target_date),
             }, indent=2)
@@ -2690,15 +2723,17 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
         to_remove = matches[: params.max_matches]
         removed = []
         for e in to_remove:
-            remove_food_entry(client, e["entry_id"])
+            remove_diary_entry_v2(client, e["entry_id"])
             removed.append({
                 "entry_id": e["entry_id"],
                 "name": e["name"],
                 "meal": e["meal"],
             })
+        _verify_removed(client, target_date, [e["entry_id"] for e in removed])
 
         return json.dumps({
             "success": True,
+            "verified": True,
             "removed": removed,
             "matched_count": len(matches),
             "remaining_matches_skipped": max(
@@ -3404,9 +3439,40 @@ async def mfp_delete_fast(params: DeleteFastInput) -> str:
         return f"Error deleting fast: {str(e)}"
 
 
+@mcp.custom_route("/favicon.ico", methods=["GET"])
+async def favicon(request):
+    """Serve the icon at the domain root, where favicon fetchers look."""
+    from starlette.responses import Response
+
+    return Response(ICON_PNG, media_type="image/png")
+
+
 def main():
-    """Run the MCP server."""
-    mcp.run()
+    """Run the MCP server.
+
+    Transport is chosen by MFP_MCP_TRANSPORT: "stdio" (default) or
+    "streamable-http". HTTP mode serves at /<MFP_MCP_PATH_SECRET>/mcp on
+    $PORT; the unguessable path is the only access control, so the secret
+    is required.
+    """
+    transport = os.environ.get("MFP_MCP_TRANSPORT", "stdio")
+    if transport == "streamable-http":
+        secret = os.environ.get("MFP_MCP_PATH_SECRET", "")
+        if len(secret) < 32 or not secret.isalnum():
+            raise SystemExit(
+                "MFP_MCP_PATH_SECRET must be set to an alphanumeric string of at least "
+                "32 characters in streamable-http mode."
+            )
+        mcp.settings.host = "0.0.0.0"
+        mcp.settings.port = int(os.environ.get("PORT", "8000"))
+        mcp.settings.streamable_http_path = f"/{secret}/mcp"
+        mcp.settings.stateless_http = True
+        # The constructor enabled localhost-only Host checks; the public
+        # hostname would fail them.
+        mcp.settings.transport_security = None
+    elif transport != "stdio":
+        raise SystemExit(f"Unsupported MFP_MCP_TRANSPORT: {transport!r}")
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":

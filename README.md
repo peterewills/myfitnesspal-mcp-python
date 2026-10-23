@@ -559,6 +559,36 @@ docker run -it --rm \
   mfp-mcp
 ```
 
+## Remote Deployment (Railway, for claude.ai and mobile)
+
+The server can run over streamable HTTP so claude.ai, including the mobile apps, can use it as a custom connector. A remote host has no browser, so it gets your MFP session as cookies in `MFP_COOKIES_JSON`. claude.ai connectors cannot send a password header, so access control is an unguessable secret in the URL path: the server answers only at `/<MFP_MCP_PATH_SECRET>/mcp`. Treat the full URL as a password; anyone holding it has read/write access to your MFP account.
+
+| Variable              | Value                                                         |
+|-----------------------|---------------------------------------------------------------|
+| `MFP_MCP_TRANSPORT`   | `streamable-http`                                             |
+| `MFP_MCP_PATH_SECRET` | alphanumeric, at least 32 characters (`openssl rand -hex 32`) |
+| `MFP_COOKIES_JSON`    | output of `scripts/export_cookies.py`                         |
+| `PORT`                | set by Railway                                                |
+
+```bash
+railway login
+railway init                      # create the project
+railway up --detach               # build from the Dockerfile
+railway variables --set MFP_MCP_TRANSPORT=streamable-http \
+                  --set "MFP_MCP_PATH_SECRET=$(openssl rand -hex 32)"
+# Log into myfitnesspal.com in a Chromium browser first
+railway variables --set "MFP_COOKIES_JSON=$(uv run python scripts/export_cookies.py)"
+railway domain                    # assign a public *.up.railway.app domain
+```
+
+Then in claude.ai: Settings → Connectors → Add custom connector, URL `https://<domain>/<secret>/mcp`, no OAuth. Connectors added on the web are available in the mobile apps. To print the URL later, from the linked repo:
+
+```bash
+railway variables --json | python3 -c "import json,sys; v=json.load(sys.stdin); print(f\"https://{v['RAILWAY_PUBLIC_DOMAIN']}/{v['MFP_MCP_PATH_SECRET']}/mcp\")"
+```
+
+When the MFP session expires, tools fail with an authentication error. Log in again in your browser and rerun the `MFP_COOKIES_JSON` line; Railway redeploys on variable changes.
+
 ## Troubleshooting
 
 ### "python: command not found" or wrong Python version

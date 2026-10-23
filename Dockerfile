@@ -38,5 +38,5 @@ USER mcp
 # Expose default port (for HTTP transport if needed)
 EXPOSE 8000
 
-# Default command runs the MCP server with stdio transport
-ENTRYPOINT ["python", "-m", "mfp_mcp.server"]
+# Default command runs the MCP server; MFP_MCP_TRANSPORT selects stdio (default) or streamable-http
+CMD ["python", "-m", "mfp_mcp.server"]
