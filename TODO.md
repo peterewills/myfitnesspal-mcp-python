@@ -1,0 +1,4 @@
+# TODO
+
+- **Deploy from GitHub.** Connect the Railway service to `peterewills/myfitnesspal-mcp-python` so pushes to `main` deploy automatically, replacing manual `railway up --ci`. Then drop the "not connected to GitHub" line from the README. The live service currently predates the access-log redaction of the path secret (commit after c7d2a3d), so until the next deploy the secret still appears in Railway's logs.
+- **Scheduled cookie refresh.** `MFP_COOKIES_JSON` goes stale about 30 days after export, because MFP refreshes the session cookie only in the browser. Options: a scheduled job on the Mac that reruns `scripts/export_cookies.py` and sets the Railway variable (needs Chrome to stay logged in and the Keychain to allow access unattended); or have the server save the refreshed `Set-Cookie` values MFP returns to a Railway volume, so the session renews whenever it is used at least once a month. Then update the README's "Session expiry" section.

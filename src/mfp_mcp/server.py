@@ -3447,6 +3447,22 @@ async def favicon(request):
     return Response(ICON_PNG, media_type="image/png")
 
 
+class _RedactPathSecret(logging.Filter):
+    """Keep the URL path secret out of the access log."""
+
+    def __init__(self, secret: str):
+        super().__init__()
+        self.secret = secret
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                a.replace(self.secret, "<secret>") if isinstance(a, str) else a
+                for a in record.args
+            )
+        return True
+
+
 def main():
     """Run the MCP server.
 
@@ -3463,6 +3479,7 @@ def main():
                 "MFP_MCP_PATH_SECRET must be set to an alphanumeric string of at least "
                 "32 characters in streamable-http mode."
             )
+        logging.getLogger("uvicorn.access").addFilter(_RedactPathSecret(secret))
         mcp.settings.host = "0.0.0.0"
         mcp.settings.port = int(os.environ.get("PORT", "8000"))
         mcp.settings.streamable_http_path = f"/{secret}/mcp"

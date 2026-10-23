@@ -2,6 +2,13 @@
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that enables AI assistants like Claude to interact with your MyFitnessPal data, including food diary, exercises, body measurements, nutrition goals, and water intake.
 
+It runs two ways:
+
+- **Locally over stdio**, for Claude Desktop and Claude Code. It reads your MFP session from your browser. See [Configuration for Claude Desktop](#configuration-for-claude-desktop).
+- **Remotely over streamable HTTP**, for claude.ai on the web and in the mobile apps. This fork deploys it on Railway, with the session supplied as an environment variable and the endpoint guarded by a secret URL path. See [Remote Deployment](#remote-deployment-railway-for-claudeai-and-mobile).
+
+The server also sends usage instructions to the client (read the diary before logging, how to correct custom foods, net carbs), so they need not be repeated in your prompts.
+
 ## Features
 
 | Tool | Type | Description |
@@ -40,6 +47,10 @@ authenticated with your existing session token.
 custom-food create, so these call the same cookie-authenticated web endpoints their
 website uses (`/api/auth/csrf`, `/api/services/users/foods/mine`, `/api/services/foods`).
 No browser needs to be running — the stored session cookies are sufficient.
+
+**Diary entry ids and deletes** also use the v2 API: `GET /v2/diary?types=food_entry` lists every food entry for a day with its UUID, including entries logged in the MFP app or website, and `DELETE /v2/diary/{uuid}` removes one. `mfp_get_diary` attaches these UUIDs as `entry_id`. The legacy `/food/remove/{id}` endpoint this server used to call returns success without deleting anything, so it is no longer used.
+
+**Writes check themselves.** After `mfp_add_food_to_diary` and `mfp_remove_food_from_diary`, the server re-lists the day and returns an error if the entry is not (or is still) there. A successful response carries `"verified": true`.
 
 That interface is undocumented and was determined by observing the web client. It works today,
 but MyFitnessPal can change it without notice. They have already done so once: this server
@@ -104,6 +115,7 @@ This MCP supports multiple authentication methods:
 | **Encrypted credentials (legacy)** | Add encrypted `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config; set `MFP_SECRET_KEY` outside the config (for example via shell env or OS keychain) | Form login no longer works against MFP's NextAuth backend — only useful if cached cookies are still valid |
 | **Plain credentials (legacy)** | Add `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config | Same as above — form login flow is deprecated |
 | **Browser cookies (browser_cookie3 fallback)** | Log into myfitnesspal.com in Chrome or Firefox via the default profile paths | Until browser session expires |
+| **Cookies in `MFP_COOKIES_JSON` (remote)** | Set the variable to the JSON from `scripts/export_cookies.py`. For hosts with no browser. | About 30 days from export (see [Session expiry](#session-expiry)) |
 
 > **Note**: MyFitnessPal migrated their authentication to NextAuth, so the
 > legacy form-POST `authenticate_with_credentials` path almost always fails
@@ -334,7 +346,9 @@ export MFP_SECRET_KEY="abc123XYZ...=="
 If `MFP_SECRET_KEY` is not found in the environment or keychain, the server treats `MFP_USERNAME` and `MFP_PASSWORD` as plain text (backward compatible).
 
 ### 2. Stored Session Cookies
-After successful authentication, session cookies are saved to `~/.mfp_mcp/cookies.json`. These persist for 30 days, so you won't need to re-authenticate frequently.
+If `MFP_COOKIES_JSON` is set to a JSON object of cookie name → value, those cookies are used and the file below is ignored. This is how remote deployments authenticate; see [Remote Deployment](#remote-deployment-railway-for-claudeai-and-mobile).
+
+Otherwise, after successful authentication, session cookies are saved to `~/.mfp_mcp/cookies.json`. These persist for 30 days, so you won't need to re-authenticate frequently.
 
 ### 3. Chromium Browser Auto-Discovery (macOS)
 
@@ -500,11 +514,14 @@ myfitnesspal-mcp-python/
 ├── pyproject.toml          # Python package configuration
 ├── README.md               # This file
 ├── scripts/
+│   ├── export_cookies.py   # Chrome MFP session -> MFP_COOKIES_JSON
 │   └── store-key.ts        # One-time key management CLI
-└── src/
-    └── mfp_mcp/
-        ├── __init__.py     # Package initialization
-        └── server.py       # MCP server implementation
+├── src/
+│   └── mfp_mcp/
+│       ├── __init__.py     # Package initialization
+│       ├── icon.png        # MyFitnessPal icon (serverInfo + /favicon.ico)
+│       └── server.py       # MCP server implementation
+└── tests/                  # Unit tests (no live MFP session needed)
 ```
 
 ## Development
@@ -547,39 +564,68 @@ mypy src/
 
 ## Docker Deployment
 
-> ⚠️ **Note**: Docker deployment requires mounting your browser's cookie database for authentication.
+The image runs stdio by default. Set `MFP_MCP_TRANSPORT=streamable-http` to serve over HTTP; see the next section for the variables that mode needs.
 
 ```bash
-# Build the image
 docker build -t mfp-mcp .
 
-# Run with Chrome cookies mounted (Linux example)
+# stdio, with Chrome cookies mounted (Linux example)
 docker run -it --rm \
   -v ~/.config/google-chrome:/root/.config/google-chrome:ro \
+  mfp-mcp
+
+# HTTP
+docker run --rm -p 8000:8000 \
+  -e MFP_MCP_TRANSPORT=streamable-http \
+  -e MFP_MCP_PATH_SECRET="$(openssl rand -hex 32)" \
+  -e MFP_COOKIES_JSON="$(uv run python scripts/export_cookies.py)" \
   mfp-mcp
 ```
 
 ## Remote Deployment (Railway, for claude.ai and mobile)
 
-The server can run over streamable HTTP so claude.ai, including the mobile apps, can use it as a custom connector. A remote host has no browser, so it gets your MFP session as cookies in `MFP_COOKIES_JSON`. claude.ai connectors cannot send a password header, so access control is an unguessable secret in the URL path: the server answers only at `/<MFP_MCP_PATH_SECRET>/mcp`. Treat the full URL as a password; anyone holding it has read/write access to your MFP account.
+claude.ai can only reach MCP servers on the public internet, so using this from the web or the mobile apps means hosting it. This fork runs it on Railway as a single always-on service built from the `Dockerfile`.
 
-| Variable              | Value                                                         |
-|-----------------------|---------------------------------------------------------------|
-| `MFP_MCP_TRANSPORT`   | `streamable-http`                                             |
-| `MFP_MCP_PATH_SECRET` | alphanumeric, at least 32 characters (`openssl rand -hex 32`) |
-| `MFP_COOKIES_JSON`    | output of `scripts/export_cookies.py`                         |
-| `PORT`                | set by Railway                                                |
+### How it is served
+
+With `MFP_MCP_TRANSPORT=streamable-http`, the server listens on `0.0.0.0:$PORT` and serves MCP's streamable HTTP transport at `/<MFP_MCP_PATH_SECRET>/mcp`. It is stateless (no session affinity needed, restarts are harmless). Every other path returns 404, except `/favicon.ico`, which serves the MyFitnessPal icon.
+
+| Variable              | Value                                                                   |
+|-----------------------|-------------------------------------------------------------------------|
+| `MFP_MCP_TRANSPORT`   | `streamable-http`                                                       |
+| `MFP_MCP_PATH_SECRET` | alphanumeric, at least 32 characters (`openssl rand -hex 32`)           |
+| `MFP_COOKIES_JSON`    | output of `scripts/export_cookies.py`                                   |
+| `TZ`                  | your timezone, e.g. `America/New_York`; "today" defaults use it         |
+| `PORT`                | set by Railway                                                          |
+
+Without `TZ` the container runs on UTC, and calls that default to today land on tomorrow's diary in the evening (after 8 pm in US Eastern).
+
+### Security model
+
+claude.ai custom connectors support OAuth or no authentication; they cannot send a fixed password or header. Running an OAuth server for one user is more machinery than the risk warrants, so the endpoint is unauthenticated and the access control is the secret in the URL path.
+
+- **What the URL grants:** read and write access to your MFP diary, foods, goals, measurements, water and fasting entries. It does not expose your MFP password, which the server never has. Treat the full URL as a password.
+- **Where the secret lives:** the Railway variable, your claude.ai connector settings, and the URL itself. Railway terminates HTTPS, so the path is encrypted in transit. The server redacts the secret from its access log (`POST /<secret>/mcp`), so it does not appear in Railway's logs.
+- **Guessing:** 32+ alphanumeric characters (256 bits from `openssl rand -hex 32`). Wrong paths get a plain 404.
+- **Rotating:** set a new `MFP_MCP_PATH_SECRET` (Railway redeploys) and update the connector URL in claude.ai. The old URL stops working immediately.
+- **The MFP session:** `MFP_COOKIES_JSON` holds live MFP session cookies, equivalent to being logged in. Anyone with access to the Railway project can read them.
+
+### Deploying
 
 ```bash
 railway login
 railway init                      # create the project
-railway up --detach               # build from the Dockerfile
+railway add --service mfp-mcp     # create an empty service and link it
 railway variables --set MFP_MCP_TRANSPORT=streamable-http \
-                  --set "MFP_MCP_PATH_SECRET=$(openssl rand -hex 32)"
+                  --set "MFP_MCP_PATH_SECRET=$(openssl rand -hex 32)" \
+                  --set TZ=America/New_York
 # Log into myfitnesspal.com in a Chromium browser first
 railway variables --set "MFP_COOKIES_JSON=$(uv run python scripts/export_cookies.py)"
+railway up --ci                   # build from the Dockerfile and deploy
 railway domain                    # assign a public *.up.railway.app domain
 ```
+
+`export_cookies.py` reads the Chrome profile named `Default` (shown as "Personal" in a default setup). The first run triggers a macOS Keychain prompt for "Chrome Safe Storage"; if it times out, the script reports no session, so rerun it after allowing access.
 
 Then in claude.ai: Settings → Connectors → Add custom connector, URL `https://<domain>/<secret>/mcp`, no OAuth. Connectors added on the web are available in the mobile apps. To print the URL later, from the linked repo:
 
@@ -587,7 +633,11 @@ Then in claude.ai: Settings → Connectors → Add custom connector, URL `https:
 railway variables --json | python3 -c "import json,sys; v=json.load(sys.stdin); print(f\"https://{v['RAILWAY_PUBLIC_DOMAIN']}/{v['MFP_MCP_PATH_SECRET']}/mcp\")"
 ```
 
-When the MFP session expires, tools fail with an authentication error. Log in again in your browser and rerun the `MFP_COOKIES_JSON` line; Railway redeploys on variable changes.
+Redeploy after code changes with `railway up --ci`. The service is not connected to GitHub, so pushing does not deploy.
+
+### Session expiry
+
+MFP's session cookie (`__Secure-next-auth.session-token`) expires 30 days after it was last refreshed. A browser stays logged in because MFP sends a refreshed cookie as you use the site; the copy in `MFP_COOKIES_JSON` never receives those refreshes, so the remote server loses access about 30 days after the export. Tools then fail with an authentication error. To fix, log into MFP in Chrome and rerun the `MFP_COOKIES_JSON` line; Railway redeploys on variable changes.
 
 ## Troubleshooting
 
@@ -688,7 +738,7 @@ pip install -e .
 ## API Reference
 
 ### mfp_get_diary
-Get food diary for a specific date.
+Get food diary for a specific date. Each entry includes its `entry_id` (UUID), usable with `mfp_remove_food_from_diary`.
 - `date` (optional): YYYY-MM-DD format, defaults to today
 - `response_format`: "markdown" or "json"
 
@@ -704,7 +754,7 @@ Get detailed nutrition for a food item.
 - `response_format`: "markdown" or "json"
 
 ### mfp_add_food_to_diary
-Add a food item to your diary for a specific meal and date.
+Add a food item to your diary for a specific meal and date. Returns the new entry's `entry_id`, and fails if the entry does not appear in the diary afterwards.
 - `mfp_id` (required): MyFitnessPal food ID from search results (use `mfp_search_food` first)
 - `meal` (optional): Meal name - "Breakfast", "Lunch", "Dinner", or "Snacks" (default: "Breakfast")
 - `date` (optional): YYYY-MM-DD format (default: today)
@@ -758,8 +808,10 @@ food is referenced by a logged diary entry.
 - `food_id` (required): Food id from `mfp_create_custom_food` or `mfp_list_own_foods`
 
 ### mfp_remove_food_from_diary
-Remove a logged entry from your diary.
-- `entry_id` (required): Diary entry id (from `mfp_get_diary`)
+Remove logged entries from your diary, including ones logged in the MFP app or website. Fails if a removed entry is still in the diary afterwards. Pass either:
+- `entry_id`: Entry UUID from `mfp_get_diary` or `mfp_add_food_to_diary`, or
+- `name_contains`: Case-insensitive substring of the food name, with optional `meal` filter and `max_matches` cap (default 1)
+- `date` (optional): YYYY-MM-DD (default today)
 
 ### mfp_get_measurements
 Get body measurement history.
@@ -821,8 +873,9 @@ Get nutrition report over a date range.
 - **Plain Credentials**: If `MFP_SECRET_KEY` is absent from both environment and keychain, `MFP_USERNAME` and `MFP_PASSWORD` are used as-is (backward compatible).
 - **Session Cookies**: After successful authentication, session cookies are cached in `~/.mfp_mcp/cookies.json` (restricted permissions) for 30 days.
 - **Browser Cookies**: As a fallback, the server can read your browser cookies to authenticate with MyFitnessPal.
-- **Local Only**: The server runs locally on your machine via stdio transport. No data is sent to any third-party servers.
-- **No External Transmission**: Your MyFitnessPal data is only transmitted between your computer and MyFitnessPal's servers (myfitnesspal.com).
+- **Remote Session Cookies**: In remote mode, `MFP_COOKIES_JSON` holds your MFP session in the host's environment (Railway variables). See [Security model](#security-model).
+- **Local mode**: Over stdio, the server runs on your machine and your MyFitnessPal data travels only between your computer and myfitnesspal.com.
+- **Remote mode**: Over HTTP, your data travels between myfitnesspal.com, the host (Railway), and Claude. The endpoint has no authentication beyond the secret URL path.
 
 ## License
 
