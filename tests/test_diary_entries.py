@@ -57,11 +57,41 @@ def test_list_sorts_by_meal_and_position_and_drops_deleted():
     assert [e["entry_id"] for e in entries] == ["a", "b", "c"]
 
 
-def test_claim_entry_id_pops_matches_in_order():
-    v2 = [
-        {"entry_id": "1", "meal": "Snacks", "name": "Apple"},
-        {"entry_id": "2", "meal": "Snacks", "name": "Apple"},
-    ]
-    assert server._claim_entry_id(v2, "snacks", "Apple, 1 small") == "1"
-    assert server._claim_entry_id(v2, "snacks", "Apple, 1 small") == "2"
-    assert server._claim_entry_id(v2, "snacks", "Apple, 1 small") is None
+def test_diary_groups_by_meal_totals_and_remaining(monkeypatch):
+    item = _item("a", "Breakfast", 0, "Eggs")
+    item["nutritional_contents"] = {"energy": {"value": 150}, "protein": 12.0}
+    item["serving_size"] = {"value": 2, "unit": "egg"}
+    item["servings"] = 1.5
+    client = _FakeClient([item])
+    monkeypatch.setattr(
+        server, "get_daily_goals", lambda c, d: {"calories": 2000.0, "protein": None}
+    )
+    diary = server.get_diary_v2(client, date(2026, 10, 22))
+    [entry] = diary["meals"]["Breakfast"]["entries"]
+    assert entry["amount"] == "3 egg"
+    assert diary["meals"]["Lunch"]["entries"] == []
+    assert diary["daily_totals"] == {"calories": 150.0, "protein": 12.0}
+    assert diary["remaining"] == {"calories": 1850.0}
+
+
+class _GoalsClient(_FakeClient):
+    def __init__(self, rules):
+        super().__init__([])
+        self._rules = rules
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        return _Resp({"items": self._rules})
+
+
+def test_daily_goals_pick_rule_valid_on_date_and_its_weekday():
+    def rule(valid_from, valid_to, calories):
+        return {"valid_from": valid_from, "valid_to": valid_to, "daily_goals": [
+            {"day_of_week": "thursday", "energy": {"value": calories}},
+            {"day_of_week": "friday", "energy": {"value": calories + 1}},
+        ]}
+
+    client = _GoalsClient([rule("2026-01-01", "2026-10-11", 1800), rule("2026-10-12", "2100-01-01", 2700)])
+    assert server.get_daily_goals(client, date(2026, 10, 22))["calories"] == 2700  # a Thursday
+    assert server.get_daily_goals(client, date(2026, 10, 23))["calories"] == 2701
+    assert server.get_daily_goals(client, date(2026, 10, 1))["calories"] == 1800
+    assert server.get_daily_goals(client, date(2025, 1, 2)) is None

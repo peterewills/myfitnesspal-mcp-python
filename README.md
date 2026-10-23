@@ -1,6 +1,6 @@
 # MyFitnessPal MCP Server
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that enables AI assistants like Claude to interact with your MyFitnessPal data, including food diary, exercises, body measurements, nutrition goals, and water intake.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that enables AI assistants like Claude to interact with your MyFitnessPal data, focused on the food diary: reading it, searching foods (including your recipes and custom foods), logging and removing entries, and managing custom foods.
 
 It runs two ways:
 
@@ -14,33 +14,20 @@ The server also sends usage instructions to the client (read the diary before lo
 | Tool | Type | Description |
 |------|------|-------------|
 | `mfp_get_diary` | Read | Get food diary entries for any date |
-| `mfp_search_food` | Read | Search the MyFitnessPal food database |
+| `mfp_search_food` | Read | Search your recipes, your custom foods and the MyFitnessPal database |
+| `mfp_list_recipes` | Read | List your saved recipes with nutrition per serving |
 | `mfp_get_food_details` | Read | Get detailed nutrition info for a food item |
-| `mfp_add_food_to_diary` | Write | Add a food item to your diary for a specific meal and date |
+| `mfp_add_food_to_diary` | Write | Log any search result (database food, custom food or recipe) to a meal and date |
 | `mfp_remove_food_from_diary` | Write | Remove a logged entry from your diary |
 | `mfp_create_custom_food` | Write | Create a private custom food with a full nutrition panel |
-| `mfp_list_own_foods` | Read | List your own custom foods (private ones do not appear in search) |
+| `mfp_list_own_foods` | Read | List your own custom foods, e.g. to find one to delete |
 | `mfp_delete_custom_food` | Write | Delete one of your custom foods |
-| `mfp_get_measurements` | Read | Get weight/body measurement history |
-| `mfp_set_measurement` | Write | Log a new weight or body measurement |
-| `mfp_get_exercises` | Read | Get logged exercises (cardio & strength) |
-| `mfp_get_goals` | Read | Get daily nutrition goals |
-| `mfp_set_goals` | Write | Update daily nutrition goals |
-| `mfp_get_water` | Read | Get water intake for a date |
-| `mfp_set_water` | Write | Log water intake for a date |
-| `mfp_get_steps` | Read | Get daily step counts synced from Apple Health / devices |
-| `mfp_log_fast` | Write | Log a completed intermittent fasting window (start + end) |
-| `mfp_update_fast` | Write | Update the start/end times of an existing fasting entry |
-| `mfp_delete_fast` | Write | Delete a fasting entry by id |
-| `mfp_get_report` | Read | Get nutrition reports over a date range |
-| `refresh_browser_cookies` | Utility | Extract and save session cookies from browser |
 
-## How diary writes work
+## How it talks to MyFitnessPal
 
-MyFitnessPal has no public API. Reads here are scraped from the website via
-[`python-myfitnesspal`](https://github.com/coddingtonbear/python-myfitnesspal), and **diary
-writes go through MFP's internal v2 JSON API** — the same one their web client uses,
-authenticated with your existing session token.
+MyFitnessPal has no public API. Everything here goes through MFP's internal JSON APIs, the ones its own web client uses, authenticated with your session: the diary, food search, food details and recipes through the v2 API (`api.myfitnesspal.com/v2`), and custom foods through the website's `/api/services` endpoints. [`python-myfitnesspal`](https://github.com/coddingtonbear/python-myfitnesspal) is used only to open the session (it trades the cookies for the v2 API's bearer token); none of its HTML scraping is used, since MFP has been retiring those pages.
+
+**The diary** (`mfp_get_diary`) reads the day's food entries from `GET /v2/diary?types=food_entry`, groups them by meal, and sums the totals. Goals come from `GET /v2/nutrient-goals`, which returns rules with a validity window and one goal set per weekday; the diary uses the one in force on that date and reports what remains. Water, notes and exercise are not included.
 
 **Custom-food writes** (`mfp_create_custom_food`, `mfp_list_own_foods`,
 `mfp_delete_custom_food`) use a different endpoint family: MFP's v2 API exposes no
@@ -48,7 +35,11 @@ custom-food create, so these call the same cookie-authenticated web endpoints th
 website uses (`/api/auth/csrf`, `/api/services/users/foods/mine`, `/api/services/foods`).
 No browser needs to be running — the stored session cookies are sufficient.
 
-**Diary entry ids and deletes** also use the v2 API: `GET /v2/diary?types=food_entry` lists every food entry for a day with its UUID, including entries logged in the MFP app or website, and `DELETE /v2/diary/{uuid}` removes one. `mfp_get_diary` attaches these UUIDs as `entry_id`. The legacy `/food/remove/{id}` endpoint this server used to call returns success without deleting anything, so it is no longer used.
+**Diary entry ids and deletes** also use the v2 API: `GET /v2/diary?types=food_entry` lists every food entry for a day with its UUID, including entries logged in the MFP app or website, and `DELETE /v2/diary/{uuid}` removes one. `mfp_get_diary` reads the same endpoint, so every entry carries its UUID as `entry_id`. The legacy `/food/remove/{id}` endpoint this server used to call returns success without deleting anything, so it is no longer used.
+
+**Recipes.** `GET /v2/recipes` lists the recipe box. A logged recipe is an ordinary diary entry whose food has `"type": "recipe"` and a different id from the recipe. No endpoint maps a recipe to that food; the two share only a `version`, and MFP creates the food the first time the recipe is logged in the app. So the server scans the last 120 days of diary for recipe foods, matches them to recipes by `version`, and caches the map in memory (built at startup in HTTP mode, rescanned at most every 10 minutes when a recipe is not found). Search returns a recipe's food id as its `mfp_id`, so `mfp_add_food_to_diary` logs recipes like any other food. When a matching recipe has no food id, search rescans first. A recipe never logged in the app, or not logged since it was last edited, cannot be logged here until it has been logged there once.
+
+**Search covers your own foods.** Recipes and custom foods are private, so MFP's database search (`GET /v2/search/nutrition`) never returns them. `mfp_search_food` matches them by name (every query word must appear) and lists them first, tagged `"source": "recipe"` or `"custom"`, ahead of `"database"` results.
 
 **Writes check themselves.** After `mfp_add_food_to_diary` and `mfp_remove_food_from_diary`, the server re-lists the day and returns an error if the entry is not (or is still) there. A successful response carries `"verified": true`.
 
@@ -56,35 +47,6 @@ That interface is undocumented and was determined by observing the web client. I
 but MyFitnessPal can change it without notice. They have already done so once: this server
 originally posted to `/food/diary/{user}/add`, which now returns 404, leaving food logging
 broken. If logging starts failing, that is the most likely cause.
-
-## How fasting works (write-only)
-
-**Fasting tools** (`mfp_log_fast`, `mfp_update_fast`, `mfp_delete_fast`) POST / PATCH /
-DELETE against `/v2/diary/fasting_entry` on the same v2 JSON API. Payloads match the
-shape captured from the iOS app:
-
-```json
-{"items": [{
-  "type": "fasting_entry",
-  "id": "UPPERCASE-UUID",
-  "fast_started": "2026-08-06T13:00:00Z",
-  "fast_ended":   "2026-08-07T05:00:00Z"
-}]}
-```
-
-Ids are client-generated UUIDv4s in uppercase (the iOS convention). The MCP auto-generates
-one when you omit `id` from `mfp_log_fast`; save the returned id if you plan to update or
-delete the entry.
-
-**There is no read endpoint.** MFP exposes no GET for fasting entries — `GET /v2/diary/fasting_entry`
-returns `405 Method Not Allowed`. The mobile app populates its Fasting History screen via a
-delta-sync channel (`mobile-sync-api.myfitnesspal.com/v2.1/sync`) that requires a pre-issued
-sync token, is scoped to the mobile OAuth client, and rejects the web-session bearer this
-server authenticates with. You'll continue to read fasting history in the MFP app itself
-until Under Armour publishes something.
-
-The write tools are still useful for automating log-entry (e.g. inferring fasts from your
-Garmin sleep window + first-meal timestamp) or correcting entries programmatically.
 
 ## Prerequisites
 
@@ -115,7 +77,7 @@ This MCP supports multiple authentication methods:
 | **Encrypted credentials (legacy)** | Add encrypted `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config; set `MFP_SECRET_KEY` outside the config (for example via shell env or OS keychain) | Form login no longer works against MFP's NextAuth backend — only useful if cached cookies are still valid |
 | **Plain credentials (legacy)** | Add `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config | Same as above — form login flow is deprecated |
 | **Browser cookies (browser_cookie3 fallback)** | Log into myfitnesspal.com in Chrome or Firefox via the default profile paths | Until browser session expires |
-| **Cookies in `MFP_COOKIES_JSON` (remote)** | Set the variable to the JSON from `scripts/export_cookies.py`. For hosts with no browser. | About 30 days from export (see [Session expiry](#session-expiry)) |
+| **Cookies in `MFP_COOKIES_JSON` (remote)** | Set the variable to the JSON from `scripts/export_cookies.py`. For hosts with no browser. | Renewed by the server indefinitely, if `MFP_STATE_DIR` is persistent (see [Session refresh](#session-refresh)) |
 
 > **Note**: MyFitnessPal migrated their authentication to NextAuth, so the
 > legacy form-POST `authenticate_with_credentials` path almost always fails
@@ -365,13 +327,12 @@ them.
 The first successful extraction is persisted to `~/.mfp_mcp/cookies.json`,
 so subsequent calls skip the discovery step until the session expires.
 
-You can also force a specific browser via the `refresh_browser_cookies`
-MCP tool:
+To force a re-read, or pick a browser, run:
 
-```
-refresh_browser_cookies(browser="arc")     # or "chrome", "edge", "brave", ...
-refresh_browser_cookies(browser="auto")    # scan everything (default)
-refresh_browser_cookies(browser="firefox") # via browser_cookie3
+```bash
+uv run python scripts/refresh_local_cookies.py                    # scan everything (default)
+uv run python scripts/refresh_local_cookies.py --browser arc      # or chrome, edge, brave, ...
+uv run python scripts/refresh_local_cookies.py --browser firefox  # via browser_cookie3
 ```
 
 ### 4. browser_cookie3 Fallback (Legacy)
@@ -410,8 +371,7 @@ Files this server writes to `~/.mfp_mcp/` (directory mode `0700`):
 |------|----------|------|
 | `cookies.json` | Session cookies — full account access, treat as a password | `0600` |
 
-Note that this server can **modify your diary** — adding food entries and updating goals,
-measurements, and water.
+Note that this server can **modify your diary** and your custom foods.
 
 ## Usage Examples
 
@@ -430,13 +390,6 @@ Once configured, you can interact with your MyFitnessPal data through Claude:
 "Add 2 cups of oatmeal to breakfast"
 ```
 
-### Track Weight Progress
-```
-"Show my weight history for the past 30 days"
-"Log my weight as 232.5 pounds"
-"What's my weight trend this month?"
-```
-
 ### Search Foods
 ```
 "Search MyFitnessPal for chicken breast"
@@ -444,24 +397,17 @@ Once configured, you can interact with your MyFitnessPal data through Claude:
 "Look up calories in a banana"
 ```
 
+### Recipes
+```
+"Log a serving of my liver and onions for dinner"
+"What recipes do I have?"
+```
+
 ### Check Goals vs Actual
 ```
 "Compare my nutrition goals to what I actually ate today"
 "Am I on track with my protein intake?"
 "How many calories do I have left today?"
-```
-
-### Exercise Log
-```
-"What exercises did I log today?"
-"Show my workout from yesterday"
-```
-
-### Nutrition Reports
-```
-"Show my calorie intake over the past week"
-"What's my average protein intake this week?"
-"Generate a nutrition report for January"
 ```
 
 ## Key Management CLI
@@ -515,6 +461,8 @@ myfitnesspal-mcp-python/
 ├── README.md               # This file
 ├── scripts/
 │   ├── export_cookies.py   # Chrome MFP session -> MFP_COOKIES_JSON
+│   ├── refresh_local_cookies.py  # Browser session -> ~/.mfp_mcp/cookies.json
+│   ├── smoke_test.py       # Call every tool over HTTP (local, Docker, Railway)
 │   └── store-key.ts        # One-time key management CLI
 ├── src/
 │   └── mfp_mcp/
@@ -596,6 +544,8 @@ With `MFP_MCP_TRANSPORT=streamable-http`, the server listens on `0.0.0.0:$PORT` 
 | `MFP_MCP_PATH_SECRET` | alphanumeric, at least 32 characters (`openssl rand -hex 32`)           |
 | `MFP_COOKIES_JSON`    | output of `scripts/export_cookies.py`                                   |
 | `TZ`                  | your timezone, e.g. `America/New_York`; "today" defaults use it         |
+| `MFP_STATE_DIR`       | `/data`, the mount path of a Railway volume; refreshed cookies go here  |
+| `RAILWAY_RUN_UID`     | `0`; volumes mount root-owned, and the image otherwise runs as `mcp`    |
 | `PORT`                | set by Railway                                                          |
 
 Without `TZ` the container runs on UTC, and calls that default to today land on tomorrow's diary in the evening (after 8 pm in US Eastern).
@@ -604,7 +554,7 @@ Without `TZ` the container runs on UTC, and calls that default to today land on 
 
 claude.ai custom connectors support OAuth or no authentication; they cannot send a fixed password or header. Running an OAuth server for one user is more machinery than the risk warrants, so the endpoint is unauthenticated and the access control is the secret in the URL path.
 
-- **What the URL grants:** read and write access to your MFP diary, foods, goals, measurements, water and fasting entries. It does not expose your MFP password, which the server never has. Treat the full URL as a password.
+- **What the URL grants:** read and write access to your MFP food diary and custom foods, and read access to your recipes. It does not expose your MFP password, which the server never has. Treat the full URL as a password.
 - **Where the secret lives:** the Railway variable, your claude.ai connector settings, and the URL itself. Railway terminates HTTPS, so the path is encrypted in transit. The server redacts the secret from its access log (`POST /<secret>/mcp`), so it does not appear in Railway's logs.
 - **Guessing:** 32+ alphanumeric characters (256 bits from `openssl rand -hex 32`). Wrong paths get a plain 404.
 - **Rotating:** set a new `MFP_MCP_PATH_SECRET` (Railway redeploys) and update the connector URL in claude.ai. The old URL stops working immediately.
@@ -621,7 +571,10 @@ railway variables --set MFP_MCP_TRANSPORT=streamable-http \
                   --set TZ=America/New_York
 # Log into myfitnesspal.com in a Chromium browser first
 railway variables --set "MFP_COOKIES_JSON=$(uv run python scripts/export_cookies.py)"
-railway up --ci                   # build from the Dockerfile and deploy
+railway volume add --mount-path /data
+railway variables --set MFP_STATE_DIR=/data --set RAILWAY_RUN_UID=0
+railway service source connect --repo <owner>/myfitnesspal-mcp-python \
+                --branch main --service mfp-mcp   # deploy on every push to main
 railway domain                    # assign a public *.up.railway.app domain
 ```
 
@@ -633,7 +586,7 @@ Then in claude.ai: Settings → Connectors → Add custom connector, URL `https:
 railway variables --json | python3 -c "import json,sys; v=json.load(sys.stdin); print(f\"https://{v['RAILWAY_PUBLIC_DOMAIN']}/{v['MFP_MCP_PATH_SECRET']}/mcp\")"
 ```
 
-Redeploy after code changes with `railway up --ci`. The service is not connected to GitHub, so pushing does not deploy.
+Every push to `main` builds the `Dockerfile` and deploys; there is no manual step. `railway up --ci` still deploys the local working tree directly, e.g. to try uncommitted changes, and the next push replaces it. After a deploy, confirm it with `scripts/smoke_test.py --railway`.
 
 ### Smoke testing
 
@@ -645,13 +598,17 @@ uv run python scripts/smoke_test.py --docker    # the Docker image, configured a
 uv run python scripts/smoke_test.py --railway   # the deployed service
 ```
 
-Add `--writes` to also add and remove a diary entry, create and delete a custom food, and log, update and delete a fast, all on 2025-01-01 or with throwaway names. `mfp_set_goals`, `mfp_set_measurement` and `mfp_set_water` are not exercised because they have no undo.
+Add `--writes` to also add and remove a diary entry and a recipe, and create and delete a custom food, all on 2025-01-01 or with throwaway names.
 
 Local and Docker runs use your home IP. Some MFP endpoints behave differently from datacenter IPs (the HTML food search returned empty results from Railway, which is why search now uses the v2 API), so only `--railway` proves the deployed service works.
 
-### Session expiry
+### Session refresh
 
-MFP's session cookie (`__Secure-next-auth.session-token`) expires 30 days after it was last refreshed. A browser stays logged in because MFP sends a refreshed cookie as you use the site; the copy in `MFP_COOKIES_JSON` never receives those refreshes, so the remote server loses access about 30 days after the export. Tools then fail with an authentication error. To fix, log into MFP in Chrome and rerun the `MFP_COOKIES_JSON` line; Railway redeploys on variable changes.
+MFP's session cookie (`__Secure-next-auth.session-token`) is a NextAuth JWT that expires 30 days after it was issued. Each `GET /api/auth/session` returns a new one with a fresh 30 days, which is how a browser stays logged in. In HTTP mode the server does the same: a background thread calls it at startup and every 6 hours and saves the refreshed cookies to `$MFP_STATE_DIR/cookies.json`. With that directory on a Railway volume, the session survives restarts and redeploys and never lapses as long as the service runs.
+
+`MFP_COOKIES_JSON` only seeds the session. The saved file records a fingerprint of the variable it descends from, so setting a new export replaces the saved cookies; otherwise the saved (newer) ones win.
+
+Re-export only if the refresh fails. It logs `MFP session refresh failed` to Railway's logs, and tools return authentication errors. Possible causes, none observed so far: MFP revoking sessions (e.g. on a password change) or enforcing a maximum session age. To re-export, log into MFP in Chrome and rerun the `MFP_COOKIES_JSON` line; Railway redeploys on variable changes.
 
 ## Troubleshooting
 
@@ -683,8 +640,8 @@ pip install -e .
 1. **Easiest (macOS)**: Log into [myfitnesspal.com](https://www.myfitnesspal.com)
    in any Chromium-based browser (Arc, Chrome, Edge, Brave, ...). The MCP
    will auto-discover the session on the next call.
-2. **Force a refresh**: Call the `refresh_browser_cookies` tool — `auto`
-   scans every browser, or pass a specific name (`arc`, `chrome`, `edge`,
+2. **Force a refresh**: Run `scripts/refresh_local_cookies.py` — it scans
+   every browser by default, or pass `--browser` (`arc`, `chrome`, `edge`,
    `brave`, `vivaldi`, `opera`, `firefox`).
 3. **If using credentials**: Double-check your MFP_USERNAME and MFP_PASSWORD
    in the config. Note that the legacy form-login flow no longer works
@@ -752,12 +709,12 @@ pip install -e .
 ## API Reference
 
 ### mfp_get_diary
-Get food diary for a specific date. Each entry includes its `entry_id` (UUID), usable with `mfp_remove_food_from_diary`.
+Get the food diary for a date: entries by meal (each with `entry_id`, usable with `mfp_remove_food_from_diary`, plus name, brand, amount, servings and nutrition), per-meal and daily totals, `daily_goals`, and `remaining` (goal minus total).
 - `date` (optional): YYYY-MM-DD format, defaults to today
 - `response_format`: "markdown" or "json"
 
 ### mfp_search_food
-Search the MyFitnessPal food database.
+Search for foods. Your recipes and custom foods whose names contain every query word come first (`source`: `"recipe"`, `"custom"`), then MyFitnessPal database results (`"database"`). A recipe's `mfp_id` is null if it cannot be logged yet (see `mfp_list_recipes`).
 - `query` (required): Search term
 - `limit` (optional): Max results (default 10, max 50)
 - `response_format`: "markdown" or "json"
@@ -809,6 +766,11 @@ fibre.
 **MyFitnessPal has no custom-food update endpoint.** To correct a food, create the corrected
 version and then `mfp_delete_custom_food` the old one.
 
+### mfp_list_recipes
+List your saved recipes, for browsing: `recipe_id`, `name`, `servings`, nutrition `per_serving` (calories, protein, carbs, fat, fiber), and `mfp_id`, the food id that logs it with `mfp_add_food_to_diary`. `mfp_id` is null for a recipe not logged in the MFP app since it was last edited; log it there once to make it loggable here.
+- `search` (optional): Words to match in the recipe name
+- `response_format`: "markdown" or "json" (default "json")
+
 ### mfp_list_own_foods
 List your own custom foods, newest first. Private custom foods do not reliably appear in
 `mfp_search_food`, so this is how to find the `id` of something you created earlier.
@@ -827,59 +789,6 @@ Remove logged entries from your diary, including ones logged in the MFP app or w
 - `name_contains`: Case-insensitive substring of the food name, with optional `meal` filter and `max_matches` cap (default 1)
 - `date` (optional): YYYY-MM-DD (default today)
 
-### mfp_get_measurements
-Get body measurement history.
-- `measurement` (optional): "Weight", "Body Fat", "Waist", etc.
-- `start_date` (optional): YYYY-MM-DD (default 30 days ago)
-- `end_date` (optional): YYYY-MM-DD (default today)
-- `response_format`: "markdown" or "json"
-
-### mfp_set_measurement
-Log a body measurement for today.
-- `measurement` (optional): Type (default "Weight")
-- `value` (required): Numeric value
-
-### mfp_get_exercises
-Get exercise log for a date.
-- `date` (optional): YYYY-MM-DD (default today)
-- `response_format`: "markdown" or "json"
-
-### mfp_get_goals
-Get daily nutrition goals.
-- `date` (optional): YYYY-MM-DD (default today)
-- `response_format`: "markdown" or "json"
-
-### mfp_set_goals
-Update nutrition goals.
-- `calories` (optional): Daily calorie goal
-- `protein` (optional): Daily protein in grams
-- `carbohydrates` (optional): Daily carbs in grams
-- `fat` (optional): Daily fat in grams
-
-### mfp_get_water
-Get water intake for a date.
-- `date` (optional): YYYY-MM-DD (default today)
-
-### mfp_set_water
-Log water intake for a date.
-- `cups` (required): Number of cups of water (e.g., 2.5 for 2.5 cups). Note: MyFitnessPal uses cups as the unit (1 cup = ~237ml)
-- `date` (optional): YYYY-MM-DD format (default: today)
-
-### mfp_get_steps
-Get daily step counts synced into MyFitnessPal (Apple Health, Google Fit, connected devices). Days with no synced data return `steps: null`.
-- `start_date` (optional): YYYY-MM-DD (default 6 days before end_date)
-- `end_date` (optional): YYYY-MM-DD (default today)
-- `response_format`: "markdown" or "json"
-
-Maximum 31 days per call (MFP's API returns one day per request).
-
-### mfp_get_report
-Get nutrition report over a date range.
-- `report_name` (optional): "Net Calories", "Protein", "Fat", "Carbs"
-- `start_date` (optional): YYYY-MM-DD (default 7 days ago)
-- `end_date` (optional): YYYY-MM-DD (default today)
-- `response_format`: "markdown" or "json"
-
 ## Security & Privacy
 
 - **Encrypted Credentials**: Credentials can be stored as Fernet-encrypted ciphertext in your config. `MFP_SECRET_KEY` is resolved at runtime from the environment variable first, then the OS keychain (`mfp-mcp` / `MFP_SECRET_KEY`). See [Encrypted Credentials](#encrypted-credentials-enhanced-security) for setup.
@@ -897,6 +806,6 @@ MIT License - See [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
 
-- [python-myfitnesspal](https://github.com/coddingtonbear/python-myfitnesspal) - The underlying library for MyFitnessPal access
+- [python-myfitnesspal](https://github.com/coddingtonbear/python-myfitnesspal) - Session setup for MyFitnessPal access
 - [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) - Model Context Protocol framework
 - [Anthropic](https://anthropic.com) - Claude and the MCP specification

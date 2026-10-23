@@ -24,13 +24,12 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import uuid
-from datetime import date, datetime, timedelta, timezone
+import threading
+from datetime import date, datetime, timedelta
 from http.cookiejar import CookieJar, Cookie
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
-from collections import OrderedDict
 import time
 from cryptography.fernet import Fernet
 import keyring
@@ -65,12 +64,16 @@ mcp = FastMCP(
         "Custom foods cannot be edited. To correct one, create the fixed version "
         "with mfp_create_custom_food, then delete the old one with "
         "mfp_delete_custom_food.\n"
-        "Custom-food carbs are NET carbs under the default country_code."
+        "Custom-food carbs are NET carbs under the default country_code.\n"
+        "Prefer the user's own recipes and custom foods over database foods: "
+        "mfp_search_food lists them first. Log any search result, recipe or not, with "
+        "mfp_add_food_to_diary and its mfp_id."
     ),
 )
 
-# Configuration paths
-CONFIG_DIR = Path.home() / ".mfp_mcp"
+# Configuration paths. MFP_STATE_DIR points remote deployments at a persistent
+# volume, so refreshed session cookies survive restarts.
+CONFIG_DIR = Path(os.environ.get("MFP_STATE_DIR") or Path.home() / ".mfp_mcp")
 COOKIES_FILE = CONFIG_DIR / "cookies.json"
 
 # MyFitnessPal's v2 JSON API, used for diary writes. The legacy HTML form
@@ -102,6 +105,7 @@ def save_cookies(cookies: Dict[str, str]):
     cookie_data = {
         "cookies": cookies,
         "saved_at": datetime.now().isoformat(),
+        "seed": _env_cookies_seed(),
     }
     with open(COOKIES_FILE, "w") as f:
         json.dump(cookie_data, f, indent=2)
@@ -110,43 +114,62 @@ def save_cookies(cookies: Dict[str, str]):
     logger.info(f"Saved session cookies to {COOKIES_FILE}")
 
 
+def _env_cookies_seed() -> Optional[str]:
+    """Fingerprint of MFP_COOKIES_JSON, recorded with saved cookies so a new
+    export can be told apart from the one the saved cookies descend from."""
+    env_cookies = os.environ.get("MFP_COOKIES_JSON")
+    return hashlib.sha256(env_cookies.encode()).hexdigest() if env_cookies else None
+
+
+def _parse_env_cookies() -> Optional[Dict[str, str]]:
+    env_cookies = os.environ.get("MFP_COOKIES_JSON")
+    if not env_cookies:
+        return None
+    try:
+        cookies = json.loads(env_cookies)
+        if isinstance(cookies, dict) and cookies:
+            return cookies
+        logger.warning("MFP_COOKIES_JSON is not a non-empty JSON object; ignoring it")
+    except json.JSONDecodeError as e:
+        logger.warning(f"MFP_COOKIES_JSON is not valid JSON; ignoring it: {e}")
+    return None
+
+
 def load_cookies() -> Optional[Dict[str, str]]:
     """
-    Load session cookies from the MFP_COOKIES_JSON environment variable, else from file.
+    Load session cookies from file, or from the MFP_COOKIES_JSON environment variable.
 
     MFP_COOKIES_JSON (a JSON object of cookie name -> value) is how remote
-    deployments, which have no browser to read from, receive a session.
+    deployments, which have no browser to read from, receive a session. The
+    server then saves refreshed cookies to file (see refresh_session). The file
+    wins only while it descends from the current MFP_COOKIES_JSON; a new export
+    replaces it.
 
     Returns:
         Dictionary of cookies if found and valid, None otherwise
     """
-    env_cookies = os.environ.get("MFP_COOKIES_JSON")
-    if env_cookies:
-        try:
-            cookies = json.loads(env_cookies)
-            if isinstance(cookies, dict) and cookies:
-                return cookies
-            logger.warning("MFP_COOKIES_JSON is not a non-empty JSON object; ignoring it")
-        except json.JSONDecodeError as e:
-            logger.warning(f"MFP_COOKIES_JSON is not valid JSON; ignoring it: {e}")
+    env_cookies = _parse_env_cookies()
 
     if not COOKIES_FILE.exists():
-        return None
-    
+        return env_cookies
+
     try:
         with open(COOKIES_FILE, "r") as f:
             cookie_data = json.load(f)
+
+        if env_cookies and cookie_data.get("seed") != _env_cookies_seed():
+            return env_cookies
         
         # Check if cookies are less than 30 days old
         saved_at = datetime.fromisoformat(cookie_data.get("saved_at", "2000-01-01"))
         if datetime.now() - saved_at > timedelta(days=30):
             logger.info("Stored cookies are expired (>30 days old)")
-            return None
-        
+            return env_cookies
+
         return cookie_data.get("cookies")
     except Exception as e:
         logger.warning(f"Failed to load cookies: {e}")
-        return None
+        return env_cookies
 
 
 def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal.com") -> CookieJar:
@@ -694,8 +717,6 @@ def get_mfp_client():
             try:
                 cookiejar = dict_to_cookiejar(stored_cookies)
                 client = myfitnesspal.Client(cookiejar=cookiejar)
-                # Test the connection
-                _ = client.get_date(date.today())
                 logger.info("Stored cookies are valid")
                 return client
             except Exception as e:
@@ -709,8 +730,6 @@ def get_mfp_client():
             # Create client with the new cookies
             cookiejar = dict_to_cookiejar(cookies)
             client = myfitnesspal.Client(cookiejar=cookiejar)
-            # Test the connection
-            _ = client.get_date(date.today())
             logger.info("Successfully authenticated with credentials")
             return client
 
@@ -726,8 +745,6 @@ def get_mfp_client():
         try:
             cookiejar = dict_to_cookiejar(stored_cookies)
             client = myfitnesspal.Client(cookiejar=cookiejar)
-            # Test the connection
-            _ = client.get_date(date.today())
             logger.info("Successfully authenticated with stored cookies")
             return client
         except Exception as e:
@@ -745,7 +762,6 @@ def get_mfp_client():
             browser_name, chromium_cookies = result
             cookiejar = dict_to_cookiejar(chromium_cookies)
             client = myfitnesspal.Client(cookiejar=cookiejar)
-            _ = client.get_date(date.today())
             # Only persist after we've verified it works, so a transient
             # failure can't poison cookies.json.
             save_cookies(chromium_cookies)
@@ -763,8 +779,6 @@ def get_mfp_client():
     logger.info("Attempting authentication with browser_cookie3 fallback")
     try:
         client = myfitnesspal.Client()
-        # Test the connection
-        _ = client.get_date(date.today())
         logger.info("Successfully authenticated with browser cookies")
         return client
     except Exception as e:
@@ -801,72 +815,6 @@ def parse_date(date_str: Optional[str] = None) -> date:
     if date_str is None:
         return date.today()
     return datetime.strptime(date_str, "%Y-%m-%d").date()
-
-
-def format_nutrition_dict(nutrition: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Format nutrition dictionary for consistent output.
-
-    Args:
-        nutrition: Raw nutrition dictionary
-
-    Returns:
-        dict: Formatted nutrition data
-    """
-    formatted = {}
-    for key, value in nutrition.items():
-        if hasattr(value, "magnitude"):
-            # Handle pint quantities
-            formatted[key] = float(value.magnitude)
-        else:
-            formatted[key] = value
-    return formatted
-
-
-def format_meal_entry(entry) -> Dict[str, Any]:
-    """
-    Format a meal entry for output.
-
-    Args:
-        entry: MFP Entry object
-
-    Returns:
-        dict: Formatted entry data
-    """
-    return {
-        "name": entry.name,
-        "short_name": getattr(entry, "short_name", None),
-        "quantity": getattr(entry, "quantity", None),
-        "unit": getattr(entry, "unit", None),
-        "nutrition": format_nutrition_dict(entry.totals),
-    }
-
-
-def format_exercise(exercise) -> Dict[str, Any]:
-    """
-    Format an exercise object for output.
-
-    Args:
-        exercise: MFP Exercise object
-
-    Returns:
-        dict: Formatted exercise data
-    """
-    entries = exercise.get_as_list()
-    return {"name": exercise.name, "entries": entries}
-
-
-def ordered_dict_to_dict(od: OrderedDict) -> Dict[str, Any]:
-    """
-    Convert OrderedDict with date keys to regular dict with string keys.
-
-    Args:
-        od: OrderedDict with date keys
-
-    Returns:
-        dict: Regular dict with string keys
-    """
-    return {str(k): v for k, v in od.items()}
 
 
 class ResponseFormat(str, Enum):
@@ -979,167 +927,6 @@ class GetFoodDetailsInput(BaseModel):
         ...,
         description="MyFitnessPal food item ID (obtained from search results)",
         min_length=1,
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' for human-readable or 'json' for structured data",
-    )
-
-
-class GetMeasurementsInput(BaseModel):
-    """Input model for getting measurements."""
-
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    measurement: str = Field(
-        default="Weight",
-        description="Type of measurement to retrieve (e.g., 'Weight', 'Body Fat', 'Waist')",
-    )
-    start_date: Optional[str] = Field(
-        default=None,
-        description="Start date in YYYY-MM-DD format. Defaults to 30 days ago.",
-        pattern=r"^\d{4}-\d{2}-\d{2}$",
-    )
-    end_date: Optional[str] = Field(
-        default=None,
-        description="End date in YYYY-MM-DD format. Defaults to today.",
-        pattern=r"^\d{4}-\d{2}-\d{2}$",
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' for human-readable or 'json' for structured data",
-    )
-
-
-class SetMeasurementInput(BaseModel):
-    """Input model for setting a measurement."""
-
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    measurement: str = Field(
-        default="Weight",
-        description="Type of measurement to set (e.g., 'Weight', 'Body Fat', 'Waist')",
-    )
-    value: float = Field(
-        ...,
-        description="Measurement value (e.g., 185.5 for weight in lbs)",
-        gt=0,
-    )
-
-
-class GetExercisesInput(BaseModel):
-    """Input model for getting exercises."""
-
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    date: Optional[str] = Field(
-        default=None,
-        description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
-        pattern=r"^\d{4}-\d{2}-\d{2}$",
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' for human-readable or 'json' for structured data",
-    )
-
-
-class GetGoalsInput(BaseModel):
-    """Input model for getting nutrition goals."""
-
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    date: Optional[str] = Field(
-        default=None,
-        description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
-        pattern=r"^\d{4}-\d{2}-\d{2}$",
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' for human-readable or 'json' for structured data",
-    )
-
-
-class SetGoalsInput(BaseModel):
-    """Input model for setting nutrition goals."""
-
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    calories: Optional[int] = Field(
-        default=None,
-        description="Daily calorie goal (e.g., 2000)",
-        ge=500,
-        le=10000,
-    )
-    protein: Optional[int] = Field(
-        default=None,
-        description="Daily protein goal in grams (e.g., 150)",
-        ge=0,
-        le=1000,
-    )
-    carbohydrates: Optional[int] = Field(
-        default=None,
-        description="Daily carbohydrate goal in grams (e.g., 200)",
-        ge=0,
-        le=2000,
-    )
-    fat: Optional[int] = Field(
-        default=None,
-        description="Daily fat goal in grams (e.g., 65)",
-        ge=0,
-        le=500,
-    )
-
-
-class GetWaterInput(BaseModel):
-    """Input model for getting water intake."""
-
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    date: Optional[str] = Field(
-        default=None,
-        description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
-        pattern=r"^\d{4}-\d{2}-\d{2}$",
-    )
-
-
-class GetStepsInput(BaseModel):
-    """Input model for getting daily step counts."""
-
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    start_date: Optional[str] = Field(
-        default=None,
-        description="Start date in YYYY-MM-DD format. Defaults to 6 days before end_date (7 days total).",
-        pattern=r"^\d{4}-\d{2}-\d{2}$",
-    )
-    end_date: Optional[str] = Field(
-        default=None,
-        description="End date in YYYY-MM-DD format. Defaults to today.",
-        pattern=r"^\d{4}-\d{2}-\d{2}$",
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' for human-readable or 'json' for structured data",
-    )
-
-class GetReportInput(BaseModel):
-    """Input model for getting nutrition reports."""
-
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    report_name: str = Field(
-        default="Net Calories",
-        description="Report name (e.g., 'Net Calories', 'Total Calories', 'Protein', 'Fat', 'Carbs')",
-    )
-    start_date: Optional[str] = Field(
-        default=None,
-        description="Start date in YYYY-MM-DD format. Defaults to 7 days ago.",
-        pattern=r"^\d{4}-\d{2}-\d{2}$",
-    )
-    end_date: Optional[str] = Field(
-        default=None,
-        description="End date in YYYY-MM-DD format. Defaults to today.",
-        pattern=r"^\d{4}-\d{2}-\d{2}$",
     )
     response_format: ResponseFormat = Field(
         default=ResponseFormat.MARKDOWN,
@@ -1273,6 +1060,18 @@ class ListOwnFoodsInput(BaseModel):
     )
 
 
+class ListRecipesInput(BaseModel):
+    """Input model for listing the user's recipes."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    search: str = Field(default="", description="Optional words to match in the recipe name")
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.JSON,
+        description="Output format: 'markdown' for human-readable or 'json' for structured data",
+    )
+
+
 class RemoveFoodFromDiaryInput(BaseModel):
     """Input model for removing food entries from diary."""
 
@@ -1310,24 +1109,6 @@ class RemoveFoodFromDiaryInput(BaseModel):
         description=(
             "Safety cap on how many matching entries to delete in one call."
         ),
-    )
-
-
-class SetWaterInput(BaseModel):
-    """Input model for setting water intake."""
-
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    cups: float = Field(
-        ...,
-        description="Number of cups of water (e.g., 2.5 for 2.5 cups). Note: MyFitnessPal uses cups as the unit.",
-        ge=0,
-        le=50,
-    )
-    date: Optional[str] = Field(
-        default=None,
-        description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
-        pattern=r"^\d{4}-\d{2}-\d{2}$",
     )
 
 
@@ -1577,9 +1358,102 @@ def list_own_foods(client, search: str = "") -> List[Dict[str, Any]]:
     if r.status_code != 200:
         raise RuntimeError(
             f"Could not list own foods: HTTP {r.status_code}. "
-            "The stored session may have expired — run refresh_browser_cookies."
+            "The stored session may have expired."
         )
     return r.json() or []
+
+
+# Recipes are logged as a diary food of type "recipe" whose id differs from
+# the recipe id. No endpoint maps one to the other; the only link is that
+# they share a `version`, and the food exists only once the recipe has been
+# logged (in the MFP app). So the map is built by scanning diary history.
+RECIPE_SCAN_DAYS = 120
+RECIPE_RESCAN_INTERVAL = 600  # seconds; bounds rescans triggered by misses
+_recipe_food_ids: Dict[str, str] = {}
+_recipe_scan_at: Optional[float] = None
+_recipe_scan_lock = threading.Lock()
+
+
+def list_recipes(client) -> List[Dict[str, Any]]:
+    """The user's recipe box, with nutrition per serving."""
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/recipes", headers=_mfp_api_headers(client), timeout=30
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not list recipes: HTTP {response.status_code}")
+    recipes = []
+    for r in response.json().get("items") or []:
+        servings = r.get("servings") or 1
+        total = r.get("nutritional_contents") or {}
+
+        def per_serving(value):
+            return round(value / servings, 1) if isinstance(value, (int, float)) else None
+
+        recipes.append({
+            "recipe_id": r["id"],
+            "name": " ".join((r.get("name") or "").split()),
+            "version": r.get("version"),
+            "servings": servings,
+            "per_serving": {
+                "calories": per_serving((total.get("energy") or {}).get("value")),
+                "protein": per_serving(total.get("protein")),
+                "carbs": per_serving(total.get("carbohydrates")),
+                "fat": per_serving(total.get("fat")),
+                "fiber": per_serving(total.get("fiber")),
+            },
+        })
+    return recipes
+
+
+def _scan_recipe_foods(client, days: int = RECIPE_SCAN_DAYS) -> Dict[str, str]:
+    """Map recipe version -> diary food id from the last `days` of diary."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def day_foods(day: date) -> List[Dict[str, Any]]:
+        response = client.session.get(
+            f"{MFP_API_BASE}/v2/diary",
+            params={"entry_date": day.strftime("%Y-%m-%d"), "types": "food_entry"},
+            headers=_mfp_api_headers(client),
+            timeout=30,
+        )
+        if response.status_code != 200:
+            return []
+        return [i.get("food") or {} for i in response.json().get("items") or []]
+
+    today = date.today()
+    found: Dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        # Newest day first, so setdefault keeps the most recent food per version
+        for foods in pool.map(day_foods, [today - timedelta(days=n) for n in range(days)]):
+            for f in foods:
+                if f.get("type") == "recipe" and f.get("version") and f.get("id"):
+                    found.setdefault(str(f["version"]), str(f["id"]))
+    logger.info(f"Recipe scan over {days} days found {len(found)} loggable recipes")
+    return found
+
+
+def recipe_food_ids(client, rescan: bool = False) -> Dict[str, str]:
+    """
+    Map recipe version -> loggable food id, scanned once and cached.
+
+    rescan=True scans again (for a recipe first logged in the app since the
+    last scan), at most once per RECIPE_RESCAN_INTERVAL.
+    """
+    global _recipe_scan_at
+    with _recipe_scan_lock:
+        due = _recipe_scan_at is None or (
+            rescan and time.time() - _recipe_scan_at > RECIPE_RESCAN_INTERVAL
+        )
+        if due:
+            _recipe_food_ids.update(_scan_recipe_foods(client))
+            _recipe_scan_at = time.time()
+        return dict(_recipe_food_ids)
+
+
+def _name_matches(query: str, name: str) -> bool:
+    """True if every word of the query appears in the name (case-insensitive)."""
+    name = name.lower()
+    return all(word in name for word in query.lower().split())
 
 
 def _serving_sizes(amount: float, unit: str) -> List[Dict[str, Any]]:
@@ -1764,16 +1638,8 @@ def add_food_to_diary(
         return None
 
 
-def list_diary_entries(client, target_date: date) -> List[Dict[str, Any]]:
-    """
-    List the day's food entries from the v2 diary API, including entries
-    logged in the MFP app or website.
-
-    Returns:
-        List of {"entry_id", "name", "brand", "meal", "servings", "unit",
-        "calories"} dicts in display order. `entry_id` is the v2 UUID that
-        `remove_diary_entry_v2` takes.
-    """
+def _food_entries(client, target_date: date) -> List[Dict[str, Any]]:
+    """The day's food entries from the v2 diary API, in display order."""
     date_str = target_date.strftime("%Y-%m-%d")
     response = client.session.get(
         f"{MFP_API_BASE}/v2/diary",
@@ -1783,7 +1649,7 @@ def list_diary_entries(client, target_date: date) -> List[Dict[str, Any]]:
     )
     if response.status_code != 200:
         raise RuntimeError(
-            f"Could not list diary entries for {date_str}: HTTP {response.status_code}"
+            f"Could not read the diary for {date_str}: HTTP {response.status_code}"
         )
     items = [
         i for i in response.json().get("items") or []
@@ -1792,6 +1658,19 @@ def list_diary_entries(client, target_date: date) -> List[Dict[str, Any]]:
     items.sort(key=lambda i: (VALID_MEALS.index(i["meal_name"])
                               if i.get("meal_name") in VALID_MEALS else len(VALID_MEALS),
                               i.get("meal_position", 0)))
+    return items
+
+
+def list_diary_entries(client, target_date: date) -> List[Dict[str, Any]]:
+    """
+    List the day's food entries, including entries logged in the MFP app or
+    website.
+
+    Returns:
+        List of {"entry_id", "name", "brand", "meal", "servings", "unit",
+        "calories"} dicts in display order. `entry_id` is the v2 UUID that
+        `remove_diary_entry_v2` takes.
+    """
     return [
         {
             "entry_id": i["id"],
@@ -1802,8 +1681,92 @@ def list_diary_entries(client, target_date: date) -> List[Dict[str, Any]]:
             "unit": (i.get("serving_size") or {}).get("unit"),
             "calories": ((i.get("nutritional_contents") or {}).get("energy") or {}).get("value"),
         }
-        for i in items
+        for i in _food_entries(client, target_date)
     ]
+
+
+DIARY_NUTRIENTS = (
+    "carbohydrates", "fiber", "sugar", "protein", "fat", "saturated_fat",
+    "sodium", "cholesterol", "potassium",
+)
+
+
+def _nutrients(contents: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """Calories plus DIARY_NUTRIENTS from a v2 nutritional_contents dict."""
+    energy = (contents.get("energy") or {}).get("value")
+    out = {"calories": round(energy, 1) if isinstance(energy, (int, float)) else None}
+    for key in DIARY_NUTRIENTS:
+        value = contents.get(key)
+        out[key] = round(value, 1) if isinstance(value, (int, float)) else None
+    return out
+
+
+def _sum_nutrients(rows) -> Dict[str, float]:
+    total: Dict[str, float] = {}
+    for row in rows:
+        for key, value in row.items():
+            if value is not None:
+                total[key] = round(total.get(key, 0) + value, 1)
+    return total
+
+
+def get_daily_goals(client, target_date: date) -> Optional[Dict[str, Optional[float]]]:
+    """The nutrient goals in force on a date, or None if MFP has none for it.
+
+    /v2/nutrient-goals returns rules with a validity window, each holding
+    one goal set per weekday.
+    """
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/nutrient-goals",
+        params={"date": target_date.strftime("%Y-%m-%d")},
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 200:
+        logger.warning(f"Could not read nutrient goals: HTTP {response.status_code}")
+        return None
+    day = target_date.strftime("%Y-%m-%d")
+    weekday = target_date.strftime("%A").lower()
+    for rule in response.json().get("items") or []:
+        if rule.get("valid_from", "") <= day <= rule.get("valid_to", "9999-12-31"):
+            for goal in rule.get("daily_goals") or []:
+                if goal.get("day_of_week") == weekday:
+                    return _nutrients(goal)
+    return None
+
+
+def get_diary_v2(client, target_date: date) -> Dict[str, Any]:
+    """The day's food diary: entries by meal, totals, goals and remaining."""
+    meals: Dict[str, Dict[str, Any]] = {m: {"entries": []} for m in VALID_MEALS}
+    for i in _food_entries(client, target_date):
+        food = i.get("food") or {}
+        serving = i.get("serving_size") or {}
+        servings = round(i.get("servings") or 0, 3)
+        amount = round(servings * (serving.get("value") or 1), 2)
+        meal = i.get("meal_name") or "Other"
+        meals.setdefault(meal, {"entries": []})["entries"].append({
+            "entry_id": i["id"],
+            "name": food.get("description"),
+            "brand": food.get("brand_name") or None,
+            "amount": f"{amount:g} {serving.get('unit', '')}".strip(),
+            "servings": servings,
+            "nutrition": _nutrients(i.get("nutritional_contents") or {}),
+        })
+    for m in meals.values():
+        m["totals"] = _sum_nutrients(e["nutrition"] for e in m["entries"])
+    totals = _sum_nutrients(m["totals"] for m in meals.values())
+    goals = get_daily_goals(client, target_date)
+    remaining = (
+        {k: round(v - totals.get(k, 0), 1) for k, v in goals.items() if v is not None}
+        if goals else None
+    )
+    return {
+        "date": str(target_date),
+        "meals": meals,
+        "daily_totals": totals,
+        "daily_goals": goals,
+        "remaining": remaining,
+    }
 
 
 def remove_diary_entry_v2(client, entry_id: str) -> None:
@@ -1824,90 +1787,9 @@ def remove_diary_entry_v2(client, entry_id: str) -> None:
     )
 
 
-def set_water_intake(client, target_date: date, cups: float) -> None:
-    """
-    Set water intake for a specific date.
-
-    The diary page is now a client-rendered (Next.js) page with no
-    server-rendered <form> for water, so there's no per-form authenticity
-    token to scrape the way the old measurements/food forms worked. The
-    live site's own `food/diary/water-*.js` bundle does a plain jQuery
-    `$.post("/food/water", {milliliters, date})`, authenticated the same
-    way every other jQuery-rails AJAX call on the site is: the global
-    `X-CSRF-Token` header sourced from the page's `<meta name="csrf-token">`
-    tag, not a body field. Confirmed by probing the live endpoint directly
-    (2026-08-11): POSTing to `food/water` (no username, no `/diary/`
-    prefix) with `milliliters`/`date` form fields plus that header returns
-    the updated `{"item": {"date", "milliliters"}}` and persists.
-
-    Args:
-        client: Authenticated myfitnesspal.Client instance
-        target_date: Date to set water intake
-        cups: Number of cups of water
-
-    Raises:
-        RuntimeError: If the operation fails
-    """
-    import re
-    from urllib import parse
-
-    try:
-        date_str = target_date.strftime("%Y-%m-%d")
-
-        # Any logged-in page carries the same site-wide CSRF meta tag; the
-        # diary page is as good as any and lets us reuse the existing
-        # cookie-authenticated session.
-        diary_url = parse.urljoin(client.BASE_URL_SECURE, "food/diary")
-        page = client.session.get(diary_url, timeout=30)
-        page.raise_for_status()
-
-        csrf_match = re.search(
-            r'<meta name="csrf-token" content="([^"]+)"', page.text
-        )
-        if not csrf_match:
-            raise RuntimeError("Could not find csrf-token meta tag on diary page")
-        csrf_token = csrf_match.group(1)
-
-        water_url = parse.urljoin(client.BASE_URL_SECURE, "food/water")
-        headers = {
-            "X-CSRF-Token": csrf_token,
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": diary_url,
-        }
-        milliliters = round(cups * 236.588, 2)
-
-        response = client.session.post(
-            water_url,
-            data={"milliliters": milliliters, "date": date_str},
-            headers=headers,
-            timeout=30,
-        )
-        response.raise_for_status()
-
-        logger.info(f"Successfully set water intake to {cups} cups for {target_date}")
-
-    except Exception as e:
-        # Don't expose internal error details to avoid leaking sensitive information
-        error_msg = str(e)
-        # Only include safe error information
-        if "HTTP" in error_msg or "status" in error_msg.lower():
-            raise RuntimeError(f"Failed to set water intake: {error_msg}")
-        else:
-            raise RuntimeError("Failed to set water intake. Please check your authentication and try again.")
-
-
 # ============================================================================
 # MCP Tools
 # ============================================================================
-
-
-def _claim_entry_id(v2_entries: List[Dict[str, Any]], meal: str, name: str) -> Optional[str]:
-    """Pop and return the id of the first v2 entry in `meal` whose food
-    description starts the scraped entry name, or None if none matches."""
-    for i, e in enumerate(v2_entries):
-        if e["meal"].lower() == meal.lower() and name.lower().startswith(e["name"].lower()):
-            return v2_entries.pop(i)["entry_id"]
-    return None
 
 
 @mcp.tool(
@@ -1924,9 +1806,9 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
     """
     Get the food diary for a specific date including all meals and their nutritional information.
 
-    Returns meals (Breakfast, Lunch, Dinner, Snacks) with each food entry's name,
-    entry_id (for mfp_remove_food_from_diary), quantity, and complete nutrition breakdown (calories, protein, carbs, fat, etc.).
-    Also includes daily totals and goals.
+    Returns meals (Breakfast, Lunch, Dinner, Snacks) with each food entry's
+    entry_id (for mfp_remove_food_from_diary), name, brand, amount, servings and
+    nutrition; per-meal and daily totals; the day's goals; and what remains of them.
 
     Args:
         params: GetDiaryInput containing:
@@ -1939,51 +1821,53 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
     try:
         client = get_mfp_client()
         target_date = parse_date(params.date)
-        day = client.get_date(target_date)
-
-        # Build response data
-        data = {
-            "date": str(target_date),
-            "meals": {},
-            "daily_totals": {},
-            "daily_goals": {},
-            "water": day.water,
-            "notes": day.notes or "",
-        }
-
-        try:
-            v2_entries = list_diary_entries(client, target_date)
-        except Exception as e:
-            logger.warning(f"Could not fetch entry ids for {target_date}: {e}")
-            v2_entries = []
-
-        # Process meals
-        for meal in day.meals:
-            meal_data = {
-                "entries": [
-                    {**format_meal_entry(entry),
-                     "entry_id": _claim_entry_id(v2_entries, meal.name, entry.name)}
-                    for entry in meal.entries
-                ],
-                "totals": format_nutrition_dict(meal.totals),
-            }
-            data["meals"][meal.name] = meal_data
-
-        # Get daily totals and goals
-        totals = {}
-        for entry in day.entries:
-            for key, value in entry.totals.items():
-                val = float(value.magnitude) if hasattr(value, "magnitude") else value
-                totals[key] = totals.get(key, 0) + val
-        data["daily_totals"] = totals
-        data["daily_goals"] = day.goals
-
+        data = await asyncio.to_thread(get_diary_v2, client, target_date)
         return format_response(
             data, params.response_format, f"Food Diary for {target_date}"
         )
 
     except Exception as e:
         return f"Error retrieving diary: {str(e)}"
+
+
+def _personal_matches(client, query: str) -> List[Dict[str, Any]]:
+    """The user's recipes and custom foods whose names match the query.
+
+    Both are private, so MFP's database search never returns them.
+    """
+    results = []
+    try:
+        matched = [r for r in list_recipes(client) if _name_matches(query, r["name"])]
+        food_ids = recipe_food_ids(client)
+        if any(str(r["version"]) not in food_ids for r in matched):
+            # May have been logged in the app since the last scan
+            food_ids = recipe_food_ids(client, rescan=True)
+        for r in matched:
+            results.append({
+                "name": r["name"],
+                "brand": "My recipe",
+                "serving": "1 serving",
+                "calories": r["per_serving"]["calories"],
+                "mfp_id": food_ids.get(str(r["version"])),
+                "source": "recipe",
+            })
+    except Exception as e:
+        logger.warning(f"Recipe matching failed: {e}")
+    try:
+        for f in list_own_foods(client):
+            if _name_matches(query, f.get("description") or ""):
+                serving = (f.get("serving_sizes") or [{}])[0]
+                results.append({
+                    "name": f.get("description"),
+                    "brand": f.get("brand_name") or "",
+                    "serving": f"{serving.get('value', '')} {serving.get('unit', '')}".strip(),
+                    "calories": ((f.get("nutritional_contents") or {}).get("energy") or {}).get("value"),
+                    "mfp_id": str(f.get("id")),
+                    "source": "custom",
+                })
+    except Exception as e:
+        logger.warning(f"Custom food matching failed: {e}")
+    return results
 
 
 @mcp.tool(
@@ -2001,7 +1885,11 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
     Search the MyFitnessPal food database for food items.
 
     Returns a list of matching foods with their name, brand, serving size,
-    calories, and MFP ID (which can be used with mfp_get_food_details).
+    calories, MFP ID (for mfp_get_food_details and mfp_add_food_to_diary) and
+    source. The user's own recipes ("recipe") and custom foods ("custom") that
+    match come first; prefer them over database results ("database"). A recipe
+    with a null mfp_id has not been logged in the MFP app yet and cannot be
+    logged here until it has.
 
     Args:
         params: SearchFoodInput containing:
@@ -2014,7 +1902,9 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
     """
     try:
         client = get_mfp_client()
-        results = search_foods_v2(client, params.query, params.limit)
+        results = await asyncio.to_thread(_personal_matches, client, params.query)
+        for r in search_foods_v2(client, params.query, params.limit):
+            results.append({**r, "source": "database"})
         data = {"query": params.query, "count": len(results), "results": results}
 
         return format_response(
@@ -2096,482 +1986,6 @@ async def mfp_get_food_details(params: GetFoodDetailsInput) -> str:
 
 
 @mcp.tool(
-    name="mfp_get_measurements",
-    annotations={
-        "title": "Get Body Measurements",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
-    """
-    Get body measurements (weight, body fat, etc.) over a date range.
-
-    Returns historical measurement data with dates and values. Useful for
-    tracking weight loss progress and body composition changes.
-
-    Args:
-        params: GetMeasurementsInput containing:
-            - measurement (str): Type of measurement (default 'Weight')
-            - start_date (str, optional): Start date, defaults to 30 days ago
-            - end_date (str, optional): End date, defaults to today
-            - response_format (str): 'markdown' or 'json'
-
-    Returns:
-        str: Measurement history with dates and values
-    """
-    try:
-        client = get_mfp_client()
-
-        end = parse_date(params.end_date)
-        if params.start_date:
-            start = parse_date(params.start_date)
-        else:
-            start = end - timedelta(days=30)
-
-        # client.get_measurements() scrapes a "dehydratedState" key that no
-        # longer exists on the (now client-rendered) page - KeyErrors every
-        # call. The v2 endpoint below works, but its begin_date/end_date/type
-        # params don't actually filter server-side, so we filter here.
-        response = client.session.get(
-            f"{MFP_API_BASE}/v2/measurements",
-            params={
-                "type": params.measurement,
-                "begin_date": start.strftime("%Y-%m-%d"),
-                "end_date": end.strftime("%Y-%m-%d"),
-            },
-            headers=_mfp_api_headers(client),
-            timeout=30,
-        )
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Could not fetch measurements: HTTP {response.status_code}"
-            )
-
-        wanted_type = params.measurement.strip().lower()
-        measurements: OrderedDict[str, float] = OrderedDict(
-            sorted(
-                (
-                    (item["date"], float(item["value"]))
-                    for item in response.json().get("items", [])
-                    if item.get("type", "").strip().lower() == wanted_type
-                    and start <= parse_date(item["date"]) <= end
-                ),
-                key=lambda pair: pair[0],
-            )
-        )
-
-        data = {
-            "measurement_type": params.measurement,
-            "start_date": str(start),
-            "end_date": str(end),
-            "count": len(measurements),
-            "values": ordered_dict_to_dict(measurements),
-        }
-
-        # Calculate summary stats if we have data
-        if measurements:
-            values = list(measurements.values())
-            data["summary"] = {
-                "latest": values[-1] if values else None,
-                "earliest": values[0] if values else None,
-                "change": round(values[-1] - values[0], 2) if len(values) >= 2 else 0,
-                "min": min(values),
-                "max": max(values),
-                "average": round(sum(values) / len(values), 2),
-            }
-
-        return format_response(
-            data, params.response_format, f"{params.measurement} History"
-        )
-
-    except Exception as e:
-        return f"Error getting measurements: {str(e)}"
-
-
-@mcp.tool(
-    name="mfp_set_measurement",
-    annotations={
-        "title": "Log Body Measurement",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
-async def mfp_set_measurement(params: SetMeasurementInput) -> str:
-    """
-    Log a new body measurement (weight, body fat, etc.) for today.
-
-    Records the measurement value in MyFitnessPal for tracking progress.
-
-    Args:
-        params: SetMeasurementInput containing:
-            - measurement (str): Type of measurement (default 'Weight')
-            - value (float): Measurement value (e.g., 185.5)
-
-    Returns:
-        str: Confirmation message with the logged value
-    """
-    try:
-        client = get_mfp_client()
-        client.set_measurements(params.measurement, params.value)
-
-        return json.dumps(
-            {
-                "success": True,
-                "message": f"Successfully logged {params.measurement}: {params.value}",
-                "measurement": params.measurement,
-                "value": params.value,
-                "date": str(date.today()),
-            },
-            indent=2,
-        )
-
-    except Exception as e:
-        return f"Error setting measurement: {str(e)}"
-
-
-@mcp.tool(
-    name="mfp_get_exercises",
-    annotations={
-        "title": "Get Exercise Log",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def mfp_get_exercises(params: GetExercisesInput) -> str:
-    """
-    Get logged exercises for a specific date.
-
-    Returns both cardiovascular and strength training exercises with their
-    details (duration, calories burned, sets, reps, weight, etc.).
-
-    Args:
-        params: GetExercisesInput containing:
-            - date (str, optional): Date in YYYY-MM-DD format, defaults to today
-            - response_format (str): 'markdown' or 'json'
-
-    Returns:
-        str: List of exercises with details and calories burned
-    """
-    try:
-        client = get_mfp_client()
-        target_date = parse_date(params.date)
-        day = client.get_date(target_date)
-
-        data = {"date": str(target_date), "exercises": []}
-
-        for exercise in day.exercises:
-            data["exercises"].append(format_exercise(exercise))
-
-        # Calculate total calories burned
-        total_burned = 0
-        for ex in data["exercises"]:
-            for entry in ex.get("entries", []):
-                if "nutrition_information" in entry:
-                    total_burned += entry["nutrition_information"].get(
-                        "calories burned", 0
-                    )
-
-        data["total_calories_burned"] = total_burned
-
-        return format_response(
-            data, params.response_format, f"Exercise Log for {target_date}"
-        )
-
-    except Exception as e:
-        return f"Error getting exercises: {str(e)}"
-
-
-@mcp.tool(
-    name="mfp_get_goals",
-    annotations={
-        "title": "Get Nutrition Goals",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def mfp_get_goals(params: GetGoalsInput) -> str:
-    """
-    Get the user's daily nutrition goals (calories, protein, carbs, fat, etc.).
-
-    Returns the configured daily targets for all tracked nutrients.
-
-    Args:
-        params: GetGoalsInput containing:
-            - date (str, optional): Date in YYYY-MM-DD format, defaults to today
-            - response_format (str): 'markdown' or 'json'
-
-    Returns:
-        str: Daily nutrition goals and targets
-    """
-    try:
-        client = get_mfp_client()
-        target_date = parse_date(params.date)
-        day = client.get_date(target_date)
-
-        data = {"date": str(target_date), "goals": day.goals}
-
-        return format_response(data, params.response_format, "Daily Nutrition Goals")
-
-    except Exception as e:
-        return f"Error getting goals: {str(e)}"
-
-
-@mcp.tool(
-    name="mfp_set_goals",
-    annotations={
-        "title": "Update Nutrition Goals",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def mfp_set_goals(params: SetGoalsInput) -> str:
-    """
-    Update daily nutrition goals (calories, protein, carbs, fat).
-
-    Sets new daily targets for the specified nutrients. Only updates the
-    values that are provided; others remain unchanged.
-
-    Args:
-        params: SetGoalsInput containing:
-            - calories (int, optional): Daily calorie goal
-            - protein (int, optional): Daily protein goal in grams
-            - carbohydrates (int, optional): Daily carb goal in grams
-            - fat (int, optional): Daily fat goal in grams
-
-    Returns:
-        str: Confirmation message with updated goals
-    """
-    try:
-        # Check that at least one goal is provided
-        if not any(
-            [params.calories, params.protein, params.carbohydrates, params.fat]
-        ):
-            return "Error: Please provide at least one goal to update (calories, protein, carbohydrates, or fat)"
-
-        client = get_mfp_client()
-
-        # Build kwargs for set_new_goal
-        kwargs = {}
-        if params.calories:
-            kwargs["energy"] = params.calories
-        if params.protein:
-            kwargs["protein"] = params.protein
-        if params.carbohydrates:
-            kwargs["carbohydrates"] = params.carbohydrates
-        if params.fat:
-            kwargs["fat"] = params.fat
-
-        client.set_new_goal(**kwargs)
-
-        return json.dumps(
-            {
-                "success": True,
-                "message": "Successfully updated nutrition goals",
-                "updated_goals": {
-                    "calories": params.calories,
-                    "protein": params.protein,
-                    "carbohydrates": params.carbohydrates,
-                    "fat": params.fat,
-                },
-            },
-            indent=2,
-        )
-
-    except Exception as e:
-        return f"Error setting goals: {str(e)}"
-
-
-# WATER — always millilitres.
-#
-# python-myfitnesspal's `_get_water` (myfitnesspal/client.py:769) calls the
-# `/food/water` endpoint and reads `result.json()["item"]["milliliters"]`
-# directly, so `day.water` is unambiguously ml regardless of the account's
-# display unit. The old code returned `water_cups = day.water` and
-# `water_ml = day.water * 236.588` — a double bug: the raw ml value was
-# mislabelled as cups, and the "converted" ml was raw_ml * 236.588. On a
-# millilitre account that turned an 8,737 ml day into 2,067 litres.
-#
-# Fix: return the ml value under its correct name. That's the whole story.
-#
-# No `water_goal` is included: `day.goals` carries only calories,
-# carbohydrates, fat, protein, sodium and sugar (verified against a live
-# account and against python-myfitnesspal's `_get_goals`). MFP's water goal
-# lives elsewhere and isn't exposed through this client path.
-def _water_payload(day, date_str: str) -> Dict[str, Any]:
-    """Build the mfp_get_water response. Pure: no network, no client."""
-    return {"date": date_str, "water_ml": day.water}
-
-
-@mcp.tool(
-    name="mfp_get_water",
-    annotations={
-        "title": "Get Water Intake",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def mfp_get_water(params: GetWaterInput) -> str:
-    """
-    Get water intake for a specific date, in millilitres.
-
-    MyFitnessPal's `/food/water` endpoint returns the amount in a field
-    literally named `milliliters` (see python-myfitnesspal's `_get_water`),
-    so this value is always ml regardless of what unit the account's UI is
-    configured to display.
-
-    Args:
-        params: GetWaterInput containing:
-            - date (str, optional): Date in YYYY-MM-DD format, defaults to today
-
-    Returns:
-        str: JSON with `date` and `water_ml`
-    """
-    try:
-        client = get_mfp_client()
-        target_date = parse_date(params.date)
-        day = client.get_date(target_date)
-        return json.dumps(_water_payload(day, str(target_date)), indent=2)
-
-    except Exception as e:
-        return f"Error getting water intake: {str(e)}"
-
-
-# Step counts synced from Apple Health / Google Fit / device integrations land
-# in the v2 diary as `steps_aggregate` items, one per source per day:
-#   {"type": "steps_aggregate", "date": "2026-10-16", "steps": 3241,
-#    "energy": {"unit": "kilojoules", "value": 48}, "primary": true}
-# The endpoint only honours `entry_date`; from/to range params are silently
-# ignored (verified 2026-10-17), so a range costs one request per day.
-MAX_STEPS_RANGE_DAYS = 31
-
-
-def _primary_steps(items: List[Dict[str, Any]]) -> Optional[int]:
-    """Pick the day's step count, preferring the source MFP marks primary."""
-    aggregates = [i for i in items if i.get("type") == "steps_aggregate"]
-    if not aggregates:
-        return None
-    chosen = next((i for i in aggregates if i.get("primary")), aggregates[0])
-    return chosen.get("steps")
-
-
-def get_steps_range(client, start: date, end: date) -> List[Dict[str, Any]]:
-    """
-    Fetch daily step totals for each date from start to end inclusive.
-
-    Days with no synced step data get `steps: None` so callers can tell
-    "no data" apart from a genuine zero.
-
-    Raises:
-        RuntimeError: If any day's request fails
-    """
-    days = []
-    current = start
-    while current <= end:
-        date_str = current.strftime("%Y-%m-%d")
-        response = client.session.get(
-            f"{MFP_API_BASE}/v2/diary",
-            params={"entry_date": date_str, "types": "steps_aggregate"},
-            headers=_mfp_api_headers(client),
-            timeout=30,
-        )
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Could not fetch steps for {date_str}: HTTP {response.status_code}"
-            )
-        days.append({
-            "date": date_str,
-            "steps": _primary_steps(response.json().get("items") or []),
-        })
-        current += timedelta(days=1)
-    return days
-
-
-@mcp.tool(
-    name="mfp_get_steps",
-    annotations={
-        "title": "Get Daily Steps",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def mfp_get_steps(params: GetStepsInput) -> str:
-    """
-    Get daily step counts synced into MyFitnessPal (e.g. from Apple Health).
-
-    Returns one entry per day in the range. Days with no synced data have
-    `steps: null`. Ranges are limited to 31 days per call.
-
-    Args:
-        params: GetStepsInput containing:
-            - start_date (str, optional): Defaults to 6 days before end_date
-            - end_date (str, optional): Defaults to today
-            - response_format (str): 'markdown' or 'json'
-
-    Returns:
-        str: Daily step counts with a total/average summary
-    """
-    try:
-        end = parse_date(params.end_date)
-        if params.start_date:
-            start = parse_date(params.start_date)
-        else:
-            start = end - timedelta(days=6)
-
-        if start > end:
-            raise ValueError("start_date must be on or before end_date")
-        span = (end - start).days + 1
-        if span > MAX_STEPS_RANGE_DAYS:
-            raise ValueError(
-                f"Range is {span} days; the maximum is {MAX_STEPS_RANGE_DAYS}. "
-                "Split it into smaller calls."
-            )
-
-        client = get_mfp_client()
-        # One blocking HTTP request per day; run off the event loop so other
-        # MCP tools and cancellation can proceed while we fetch the range.
-        days = await asyncio.to_thread(get_steps_range, client, start, end)
-
-        counts = [d["steps"] for d in days if d["steps"] is not None]
-        data: Dict[str, Any] = {
-            "start_date": str(start),
-            "end_date": str(end),
-            "days": days,
-            "summary": {
-                "days_with_data": len(counts),
-                "total": sum(counts),
-                "average": round(sum(counts) / len(counts)) if counts else None,
-            },
-        }
-
-        if params.response_format == ResponseFormat.MARKDOWN:
-            # format_response renders lists of dicts poorly; show date: steps.
-            data["days"] = {
-                d["date"]: d["steps"] if d["steps"] is not None else "no data"
-                for d in days
-            }
-
-        return format_response(data, params.response_format, "Daily Steps")
-
-    except Exception as e:
-        return f"Error getting steps: {str(e)}"
-
-
-@mcp.tool(
     name="mfp_add_food_to_diary",
     annotations={
         "title": "Add Food to Diary",
@@ -2585,8 +1999,11 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
     """
     Add a food item to your MyFitnessPal food diary for a specific date and meal.
 
-    This tool adds a food entry to your diary. You can search for foods using
-    mfp_search_food to find the food ID (mfp_id) needed for this tool.
+    This tool adds a food entry to your diary. Find the food ID (mfp_id) with
+    mfp_search_food. It logs any search result the same way: database foods,
+    the user's custom foods, and the user's recipes (quantity = servings).
+    A recipe whose mfp_id is null cannot be logged until it has been logged
+    once in the MFP app.
 
     Args:
         params: AddFoodToDiaryInput containing:
@@ -2771,127 +2188,8 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
         return f"Error removing food: {e}"
 
 
-@mcp.tool(
-    name="mfp_set_water",
-    annotations={
-        "title": "Log Water Intake",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
-async def mfp_set_water(params: SetWaterInput) -> str:
-    """
-    Log water intake for a specific date.
-
-    Sets the number of cups of water consumed for the day. MyFitnessPal uses
-    cups as the unit (1 cup = ~237ml).
-
-    Args:
-        params: SetWaterInput containing:
-            - cups (float): Number of cups of water (e.g., 2.5 for 2.5 cups)
-            - date (str, optional): Date in YYYY-MM-DD format, defaults to today
-
-    Returns:
-        str: Confirmation message with the logged water amount
-    """
-    try:
-        client = get_mfp_client()
-        target_date = parse_date(params.date)
-        
-        # Set water intake
-        set_water_intake(client=client, target_date=target_date, cups=params.cups)
-        
-        return json.dumps(
-            {
-                "success": True,
-                "message": f"Successfully logged {params.cups} cups of water",
-                "date": str(target_date),
-                "cups": params.cups,
-                "milliliters": round(params.cups * 236.588, 2),
-            },
-            indent=2,
-        )
-        
-    except Exception as e:
-        return f"Error setting water intake: {str(e)}"
-
-
-@mcp.tool(
-    name="mfp_get_report",
-    annotations={
-        "title": "Get Nutrition Report",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def mfp_get_report(params: GetReportInput) -> str:
-    """
-    Get a nutrition report over a date range.
-
-    Returns daily values for the specified nutrient/metric over the date range.
-    Useful for analyzing trends and patterns in nutrition intake.
-
-    Args:
-        params: GetReportInput containing:
-            - report_name (str): Report type (e.g., 'Net Calories', 'Protein')
-            - start_date (str, optional): Start date, defaults to 7 days ago
-            - end_date (str, optional): End date, defaults to today
-            - response_format (str): 'markdown' or 'json'
-
-    Returns:
-        str: Daily values and summary statistics for the report period
-    """
-    try:
-        client = get_mfp_client()
-
-        end = parse_date(params.end_date)
-        if params.start_date:
-            start = parse_date(params.start_date)
-        else:
-            start = end - timedelta(days=7)
-
-        report = client.get_report(
-            report_name=params.report_name,
-            report_category="Nutrition",
-            lower_bound=start,
-            upper_bound=end,
-        )
-
-        data = {
-            "report_name": params.report_name,
-            "start_date": str(start),
-            "end_date": str(end),
-            "values": (
-                ordered_dict_to_dict(report) if isinstance(report, OrderedDict) else report
-            ),
-        }
-
-        # Calculate summary stats
-        if report:
-            values = list(report.values())
-            numeric_values = [v for v in values if isinstance(v, (int, float))]
-            if numeric_values:
-                data["summary"] = {
-                    "total": sum(numeric_values),
-                    "average": round(sum(numeric_values) / len(numeric_values), 2),
-                    "min": min(numeric_values),
-                    "max": max(numeric_values),
-                }
-
-        return format_response(
-            data, params.response_format, f"{params.report_name} Report"
-        )
-
-    except Exception as e:
-        return f"Error getting report: {str(e)}"
-
-
 # ============================================================================
-# Cookie Management Tool
+# Cookie refresh from a local browser (scripts/refresh_local_cookies.py)
 # ============================================================================
 
 
@@ -2911,8 +2209,7 @@ def _verify_cookies_and_format(cookies: Dict[str, str], source: str) -> str:
     try:
         import myfitnesspal
         cookiejar = dict_to_cookiejar(cookies)
-        client = myfitnesspal.Client(cookiejar=cookiejar)
-        _ = client.get_date(date.today())
+        myfitnesspal.Client(cookiejar=cookiejar)  # construction validates the session
     except Exception as e:
         return (
             f"Cookies were extracted from {source} but verification failed: "
@@ -2926,14 +2223,13 @@ def _verify_cookies_and_format(cookies: Dict[str, str], source: str) -> str:
     )
 
 
-@mcp.tool()
 def refresh_browser_cookies(browser: str = "auto") -> str:
     """
-    Extract and save session cookies from your web browser.
+    Extract, verify and save session cookies from a local web browser.
 
-    Use this tool when authentication fails and you need to refresh your
-    MyFitnessPal session. You must be logged into myfitnesspal.com in the
-    target browser.
+    Not an MCP tool: it needs a browser on the machine running the server.
+    Run it via scripts/refresh_local_cookies.py. You must be logged into
+    myfitnesspal.com in the target browser.
 
     Args:
         browser: Source to extract cookies from. Options:
@@ -3134,334 +2430,48 @@ async def mfp_delete_custom_food(params: DeleteCustomFoodInput) -> str:
         return f"Error deleting custom food: {str(e)}"
 
 
-# ============================================================================
-# Fasting (Intermittent) — write-only CRUD
-# ============================================================================
-#
-# MyFitnessPal's fasting feature lives at /v2/diary/fasting_entry. It supports
-# POST (create), PATCH (update), and DELETE — but NOT GET. There is no public
-# read/list endpoint: the mobile app hydrates its Fasting History screen via a
-# delta-sync channel (mobile-sync-api.myfitnesspal.com/v2.1/sync) that requires
-# a pre-issued sync_token, is scoped to the mobile OAuth client, and rejects
-# the web-session bearer we authenticate with. See the README for details.
-#
-# Reads therefore stay in the MFP app; the MCP owns writes.
-#
-# Schema (matches what the iOS app sends, verified 2026-08-07):
-#     {
-#       "items": [
-#         {
-#           "type": "fasting_entry",
-#           "id": "UPPERCASE-UUID",
-#           "fast_started": "YYYY-MM-DDTHH:MM:SSZ",
-#           "fast_ended":   "YYYY-MM-DDTHH:MM:SSZ"
-#         }
-#       ]
-#     }
-
-
-_FASTING_ENDPOINT = f"{MFP_API_BASE}/v2/diary/fasting_entry"
-
-
-def _normalize_fasting_timestamp(ts: str) -> str:
-    """Normalize an ISO 8601 timestamp to MFP's form: `YYYY-MM-DDTHH:MM:SSZ` (UTC).
-
-    Accepts naive strings (assumed UTC) and timezone-aware strings (converted
-    to UTC). Raises ValueError on anything that doesn't parse as ISO 8601.
+@mcp.tool(
+    name="mfp_list_recipes",
+    annotations={
+        "title": "List Recipes",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_list_recipes(params: ListRecipesInput) -> str:
     """
-    # `datetime.fromisoformat` in Python 3.10 doesn't understand a trailing
-    # `Z`; swap it for `+00:00` first.
-    try:
-        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError as e:
-        raise ValueError(
-            f"Not an ISO 8601 timestamp: {ts!r} ({e})"
-        ) from None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    else:
-        parsed = parsed.astimezone(timezone.utc)
-    return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+    List the user's saved recipes with nutrition per serving.
 
+    For browsing. To log a recipe, find it with mfp_search_food and pass its
+    mfp_id to mfp_add_food_to_diary. `mfp_id` is null for a recipe that has
+    not been logged in the MFP app since it was last edited: MFP only creates
+    the loggable food on first log, so such a recipe cannot be logged from
+    here yet.
 
-def _generate_fasting_id() -> str:
-    """Fresh uppercase UUIDv4 — matches the format the iOS app uses."""
-    return str(uuid.uuid4()).upper()
+    Args:
+        params: ListRecipesInput with optional `search` words
 
-
-def _build_fasting_payload(
-    entry_id: str, fast_started: str, fast_ended: str
-) -> Dict[str, Any]:
-    """Build the request body for POST/PATCH /v2/diary/fasting_entry.
-
-    Both timestamps are normalized to UTC ISO 8601 with a trailing `Z`, matching
-    the shape observed on the wire. Raises ValueError on invalid input:
-    missing id, unparseable timestamps, or end <= start.
+    Returns:
+        Recipes with recipe_id, name, servings, per_serving nutrition, mfp_id
     """
-    if not entry_id:
-        raise ValueError("entry_id must be a non-empty string")
-    started = _normalize_fasting_timestamp(fast_started)
-    ended = _normalize_fasting_timestamp(fast_ended)
-    if ended <= started:
-        raise ValueError(
-            f"fast_ended ({ended}) must be strictly after fast_started ({started})"
-        )
-    return {
-        "items": [
-            {
-                "type": "fasting_entry",
-                "id": entry_id,
-                "fast_started": started,
-                "fast_ended": ended,
-            }
+    def run() -> Dict[str, Any]:
+        client = get_mfp_client()
+        food_ids = recipe_food_ids(client)
+        recipes = [
+            {**{k: v for k, v in r.items() if k != "version"},
+             "mfp_id": food_ids.get(str(r["version"]))}
+            for r in list_recipes(client)
+            if _name_matches(params.search, r["name"])
         ]
-    }
+        return {"count": len(recipes), "recipes": recipes}
 
-
-def create_fasting_entry(
-    client,
-    fast_started: str,
-    fast_ended: str,
-    entry_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    """POST a new fasting entry. Returns the created record (with id + timestamps)."""
-    entry_id = entry_id or _generate_fasting_id()
-    payload = _build_fasting_payload(entry_id, fast_started, fast_ended)
-    response = client.session.post(
-        _FASTING_ENDPOINT,
-        headers=_mfp_api_headers(client, json_body=True),
-        data=json.dumps(payload),
-        timeout=30,
-    )
-    if response.status_code != 201:
-        raise RuntimeError(
-            f"Failed to log fast: HTTP {response.status_code} — "
-            f"{_api_error_detail(response)}"
-        )
-    # Guard against a well-formed 201 whose body doesn't match the
-    # captured schema — surface a clear error instead of KeyError /
-    # IndexError bubbling up as "Error logging fast: 'items'".
     try:
-        entry = response.json()["items"][0]
-    except (ValueError, KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(
-            f"MFP returned HTTP 201 with an unexpected body: {response.text[:200]} ({e})"
-        ) from None
-    return {
-        "id": entry["id"],
-        "fast_started": entry["fast_started"],
-        "fast_ended": entry["fast_ended"],
-        "created_at": entry.get("created_at"),
-        "status": response.status_code,
-    }
-
-
-def update_fasting_entry(
-    client, entry_id: str, fast_started: str, fast_ended: str
-) -> Dict[str, Any]:
-    """PATCH an existing fasting entry. MFP's PATCH is a full replacement of
-    the two time fields — both must be sent, matching the iOS app's behavior."""
-    payload = _build_fasting_payload(entry_id, fast_started, fast_ended)
-    response = client.session.patch(
-        f"{_FASTING_ENDPOINT}/{entry_id}",
-        headers=_mfp_api_headers(client, json_body=True),
-        data=json.dumps(payload),
-        timeout=30,
-    )
-    if response.status_code != 204:
-        raise RuntimeError(
-            f"Failed to update fast: HTTP {response.status_code} — "
-            f"{_api_error_detail(response)}"
-        )
-    item = payload["items"][0]
-    return {
-        "id": entry_id,
-        "fast_started": item["fast_started"],
-        "fast_ended": item["fast_ended"],
-        "status": response.status_code,
-    }
-
-
-def delete_fasting_entry(client, entry_id: str) -> Dict[str, Any]:
-    """DELETE a fasting entry by id."""
-    if not entry_id:
-        raise ValueError("entry_id must be a non-empty string")
-    response = client.session.delete(
-        f"{_FASTING_ENDPOINT}/{entry_id}",
-        headers=_mfp_api_headers(client),
-        timeout=30,
-    )
-    if response.status_code != 204:
-        raise RuntimeError(
-            f"Failed to delete fast: HTTP {response.status_code} — "
-            f"{_api_error_detail(response)}"
-        )
-    return {"id": entry_id, "deleted": True, "status": response.status_code}
-
-
-# UUID pattern for fasting-entry ids. Any 8-4-4-4-12 hex is accepted (the
-# endpoint doesn't strictly require v4), but leading/trailing whitespace and
-# non-hex characters are rejected up-front — otherwise garbage ids hit MFP
-# and come back as opaque 400s.
-_FASTING_ID_PATTERN = r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
-
-
-class LogFastInput(BaseModel):
-    """Input for `mfp_log_fast`."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    fast_started: str = Field(
-        description=(
-            "Fast start time as ISO 8601 (e.g. '2026-08-06T13:00:00Z'). Naive "
-            "timestamps are assumed UTC; timezone-aware ones are converted "
-            "to UTC."
-        ),
-    )
-    fast_ended: str = Field(
-        description="Fast end time, same format. Must be strictly after fast_started.",
-    )
-    id: Optional[str] = Field(
-        default=None,
-        description=(
-            "Optional UUID (8-4-4-4-12 hex) for the new entry. Auto-generated "
-            "as an uppercase v4 UUID if omitted, matching MFP's iOS convention."
-        ),
-        pattern=_FASTING_ID_PATTERN,
-    )
-    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
-
-
-class UpdateFastInput(BaseModel):
-    """Input for `mfp_update_fast`."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str = Field(
-        description="UUID (8-4-4-4-12 hex) of the fasting entry to update.",
-        pattern=_FASTING_ID_PATTERN,
-    )
-    fast_started: str = Field(description="New start time (ISO 8601).")
-    fast_ended: str = Field(
-        description="New end time (ISO 8601). Must be strictly after fast_started."
-    )
-    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
-
-
-class DeleteFastInput(BaseModel):
-    """Input for `mfp_delete_fast`."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str = Field(
-        description="UUID (8-4-4-4-12 hex) of the fasting entry to delete.",
-        pattern=_FASTING_ID_PATTERN,
-    )
-    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
-
-
-@mcp.tool(
-    name="mfp_log_fast",
-    annotations={
-        "title": "Log Intermittent Fast",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
-async def mfp_log_fast(params: LogFastInput) -> str:
-    """
-    Log a completed intermittent fasting window in MyFitnessPal.
-
-    Creates a new entry with the given start and end times. If `id` is
-    omitted, a fresh uppercase UUIDv4 is generated (matches how the iOS
-    app self-assigns ids). The returned `id` is what `mfp_update_fast` and
-    `mfp_delete_fast` accept — save it if you plan to modify the entry
-    later.
-
-    Args:
-        params: LogFastInput (fast_started, fast_ended, id?, response_format)
-
-    Returns:
-        str: The created entry with id, timestamps, created_at, and status
-    """
-    try:
-        client = get_mfp_client()
-        result = create_fasting_entry(
-            client, params.fast_started, params.fast_ended, params.id
-        )
-        return format_response(result, params.response_format, "Fast Logged")
+        data = await asyncio.to_thread(run)
+        return format_response(data, params.response_format, "My Recipes")
     except Exception as e:
-        return f"Error logging fast: {str(e)}"
-
-
-@mcp.tool(
-    name="mfp_update_fast",
-    annotations={
-        "title": "Update Fasting Entry",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def mfp_update_fast(params: UpdateFastInput) -> str:
-    """
-    Update an existing fasting entry's start and end times.
-
-    MFP's PATCH is a full replacement of the two time fields — both must be
-    supplied even if only one is changing.
-
-    The MCP cannot list fasts (MFP exposes no read endpoint); the `id` must
-    come from a prior `mfp_log_fast` call or be captured from the MFP app.
-
-    Args:
-        params: UpdateFastInput (id, fast_started, fast_ended, response_format)
-
-    Returns:
-        str: The updated entry (id, timestamps, status)
-    """
-    try:
-        client = get_mfp_client()
-        result = update_fasting_entry(
-            client, params.id, params.fast_started, params.fast_ended
-        )
-        return format_response(result, params.response_format, "Fast Updated")
-    except Exception as e:
-        return f"Error updating fast: {str(e)}"
-
-
-@mcp.tool(
-    name="mfp_delete_fast",
-    annotations={
-        "title": "Delete Fasting Entry",
-        "readOnlyHint": False,
-        "destructiveHint": True,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def mfp_delete_fast(params: DeleteFastInput) -> str:
-    """
-    Delete a fasting entry by id.
-
-    Destructive and not recoverable. The `id` must come from a prior
-    `mfp_log_fast` call or be captured from the MFP app — the MCP cannot
-    list existing fasts because MFP exposes no read endpoint.
-
-    Args:
-        params: DeleteFastInput (id, response_format)
-
-    Returns:
-        str: Confirmation with the deleted id and HTTP status
-    """
-    try:
-        client = get_mfp_client()
-        result = delete_fasting_entry(client, params.id)
-        return format_response(result, params.response_format, "Fast Deleted")
-    except Exception as e:
-        return f"Error deleting fast: {str(e)}"
+        return f"Error listing recipes: {str(e)}"
 
 
 @mcp.custom_route("/favicon.ico", methods=["GET"])
@@ -3470,6 +2480,64 @@ async def favicon(request):
     from starlette.responses import Response
 
     return Response(ICON_PNG, media_type="image/png")
+
+
+SESSION_COOKIE = "__Secure-next-auth.session-token"
+KEEPALIVE_INTERVAL = timedelta(hours=6)
+
+
+def refresh_session() -> None:
+    """
+    Renew the MFP session and save the refreshed cookies.
+
+    The session token is a NextAuth JWT that expires 30 days after it was
+    issued. Each GET /api/auth/session returns a new one with a fresh 30
+    days, so calling this regularly keeps a session alive without a browser.
+
+    Raises:
+        RuntimeError: If MFP no longer recognises the session
+    """
+    cookies = load_cookies()
+    if not cookies:
+        raise RuntimeError("No session cookies to refresh")
+    import requests
+
+    session = requests.Session()
+    session.cookies = dict_to_cookiejar(cookies)
+    response = session.get(
+        f"{MFP_WEB_BASE}/api/auth/session", headers=_web_headers(), timeout=30
+    )
+    body = response.json() if response.status_code == 200 else {}
+    if not body.get("userId"):
+        raise RuntimeError(
+            f"MFP session is no longer valid (HTTP {response.status_code}); "
+            "re-export MFP_COOKIES_JSON"
+        )
+    # The jar can hold the old cookie (domain .myfitnesspal.com) beside the
+    # refreshed one (www.myfitnesspal.com); keep the latest-expiring of each.
+    latest: Dict[str, Cookie] = {}
+    for c in session.cookies:
+        if c.name not in latest or (c.expires or 0) > (latest[c.name].expires or 0):
+            latest[c.name] = c
+    save_cookies({name: c.value for name, c in latest.items()})
+    logger.info(f"Refreshed MFP session; it now expires {body.get('expires')}")
+
+
+def _keepalive_loop(stop: "threading.Event") -> None:
+    while True:
+        try:
+            refresh_session()
+        except Exception as e:
+            logger.error(f"MFP session refresh failed: {e}")
+        if stop.wait(KEEPALIVE_INTERVAL.total_seconds()):
+            return
+
+
+def _warm_recipe_cache() -> None:
+    try:
+        recipe_food_ids(get_mfp_client())
+    except Exception as e:
+        logger.warning(f"Recipe scan at startup failed: {e}")
 
 
 class _RedactPathSecret(logging.Filter):
@@ -3505,6 +2573,10 @@ def main():
                 "32 characters in streamable-http mode."
             )
         logging.getLogger("uvicorn.access").addFilter(_RedactPathSecret(secret))
+        threading.Thread(
+            target=_keepalive_loop, args=(threading.Event(),), daemon=True
+        ).start()
+        threading.Thread(target=_warm_recipe_cache, daemon=True).start()
         mcp.settings.host = "0.0.0.0"
         mcp.settings.port = int(os.environ.get("PORT", "8000"))
         mcp.settings.streamable_http_path = f"/{secret}/mcp"

@@ -10,8 +10,6 @@ Targets:
 
 Read-only by default. --writes also round-trips the write tools on a sacrificial
 date (2025-01-01) and a throwaway custom food, deleting everything it creates.
-Not exercised: mfp_set_goals, mfp_set_measurement, mfp_set_water (no undo) and
-refresh_browser_cookies (needs a local browser).
 
 Local and Docker runs use your home IP, so they cannot catch failures that only
 happen from a datacenter IP; run against --railway after deploying.
@@ -41,10 +39,7 @@ SCRATCH_DATE = "2025-01-01"
 EXPECTED_TOOLS = {
     "mfp_get_diary", "mfp_search_food", "mfp_get_food_details", "mfp_add_food_to_diary",
     "mfp_remove_food_from_diary", "mfp_create_custom_food", "mfp_list_own_foods",
-    "mfp_delete_custom_food", "mfp_get_measurements", "mfp_set_measurement",
-    "mfp_get_exercises", "mfp_get_goals", "mfp_set_goals", "mfp_get_water", "mfp_set_water",
-    "mfp_get_steps", "mfp_log_fast", "mfp_update_fast", "mfp_delete_fast", "mfp_get_report",
-    "refresh_browser_cookies",
+    "mfp_delete_custom_food", "mfp_list_recipes",
 }
 
 
@@ -105,10 +100,13 @@ async def run_checks(url, writes):
                 await step("mfp_get_food_details",
                            call(session, "mfp_get_food_details", mfp_id=str(mfp_id)))
             await step("mfp_get_diary", diary())
-            for tool in ("mfp_get_measurements", "mfp_get_exercises", "mfp_get_goals",
-                         "mfp_get_water", "mfp_get_steps", "mfp_get_report",
-                         "mfp_list_own_foods"):
-                await step(tool, call(session, tool))
+            async def recipes():
+                out = await call(session, "mfp_list_recipes", response_format="json")
+                check(out["count"] > 0, "no recipes listed")
+                return next((r for r in out["recipes"] if r["mfp_id"]), None)
+
+            recipe = await step("mfp_list_recipes", recipes())
+            await step("mfp_list_own_foods", call(session, "mfp_list_own_foods"))
 
             if writes and mfp_id:
                 async def diary_round_trip():
@@ -133,19 +131,18 @@ async def run_checks(url, writes):
                     check(foods, f"created food not listed: {own}")
                     await call(session, "mfp_delete_custom_food", food_id=str(foods[0]["id"]))
 
-                async def fast_round_trip():
-                    fast_id = str(uuid.uuid4()).upper()
-                    await call(session, "mfp_log_fast", id=fast_id,
-                               fast_started=f"{SCRATCH_DATE}T01:00:00Z",
-                               fast_ended=f"{SCRATCH_DATE}T02:00:00Z")
-                    await call(session, "mfp_update_fast", id=fast_id,
-                               fast_started=f"{SCRATCH_DATE}T01:00:00Z",
-                               fast_ended=f"{SCRATCH_DATE}T03:00:00Z")
-                    await call(session, "mfp_delete_fast", id=fast_id)
+                async def recipe_round_trip():
+                    check(recipe, "no loggable recipe (log one in the MFP app first)")
+                    logged = await call(session, "mfp_add_food_to_diary",
+                                        mfp_id=recipe["mfp_id"], meal="Snacks",
+                                        date=SCRATCH_DATE)
+                    check(logged.get("verified"), f"log not verified: {logged}")
+                    await call(session, "mfp_remove_food_from_diary", date=SCRATCH_DATE,
+                               entry_id=logged["entry_id"])
 
                 await step("diary add/get/remove", diary_round_trip())
+                await step("recipe add/remove", recipe_round_trip())
                 await step("custom food create/list/delete", custom_food_round_trip())
-                await step("fast log/update/delete", fast_round_trip())
 
     width = max(len(r[0]) for r in results)
     for name, status, detail in results:

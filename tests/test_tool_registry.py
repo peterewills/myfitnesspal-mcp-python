@@ -12,5 +12,10 @@ from mfp_mcp import server  # noqa: E402
 
 def test_only_tools_are_registered():
     names = {t.name for t in asyncio.run(server.mcp.list_tools())}
-    assert all(n.startswith("mfp_") or n == "refresh_browser_cookies" for n in names), names
+    assert all(n.startswith("mfp_") for n in names), names
     assert {"mfp_get_diary", "mfp_remove_food_from_diary", "mfp_add_food_to_diary"} <= names
+
+
+def test_each_tool_wraps_the_function_of_the_same_name():
+    for tool in server.mcp._tool_manager.list_tools():
+        assert tool.fn.__name__ == tool.name, (tool.name, tool.fn.__name__)
