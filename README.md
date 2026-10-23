@@ -635,6 +635,20 @@ railway variables --json | python3 -c "import json,sys; v=json.load(sys.stdin); 
 
 Redeploy after code changes with `railway up --ci`. The service is not connected to GitHub, so pushing does not deploy.
 
+### Smoke testing
+
+`scripts/smoke_test.py` calls every tool through the MCP HTTP transport, the same path claude.ai uses, and prints a pass/fail line per tool. Run it before and after deploying:
+
+```bash
+uv run python scripts/smoke_test.py --local     # this checkout, run on your machine
+uv run python scripts/smoke_test.py --docker    # the Docker image, configured as on Railway
+uv run python scripts/smoke_test.py --railway   # the deployed service
+```
+
+Add `--writes` to also add and remove a diary entry, create and delete a custom food, and log, update and delete a fast, all on 2025-01-01 or with throwaway names. `mfp_set_goals`, `mfp_set_measurement` and `mfp_set_water` are not exercised because they have no undo.
+
+Local and Docker runs use your home IP. Some MFP endpoints behave differently from datacenter IPs (the HTML food search returned empty results from Railway, which is why search now uses the v2 API), so only `--railway` proves the deployed service works.
+
 ### Session expiry
 
 MFP's session cookie (`__Secure-next-auth.session-token`) expires 30 days after it was last refreshed. A browser stays logged in because MFP sends a refreshed cookie as you use the site; the copy in `MFP_COOKIES_JSON` never receives those refreshes, so the remote server loses access about 30 days after the export. Tools then fail with an authentication error. To fix, log into MFP in Chrome and rerun the `MFP_COOKIES_JSON` line; Railway redeploys on variable changes.

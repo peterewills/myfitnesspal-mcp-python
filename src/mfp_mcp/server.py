@@ -1388,6 +1388,46 @@ def get_food_v2(client, mfp_id: str) -> Dict[str, Any]:
     return items[0]
 
 
+def search_foods_v2(client, query: str, limit: int) -> List[Dict[str, Any]]:
+    """
+    Search MFP's food database through the v2 API.
+
+    Replaces the library's HTML search, which returns an empty result page
+    when called from datacenter IPs (e.g. Railway).
+
+    Returns:
+        List of {"name", "brand", "serving", "calories", "mfp_id"} dicts,
+        calories per the first listed serving.
+    """
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/search/nutrition",
+        params={"q": query, "max_items": limit},
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Food search failed: HTTP {response.status_code}")
+    results = []
+    for entry in response.json().get("items") or []:
+        food = entry.get("item") or {}
+        if not food.get("id"):
+            continue
+        servings = food.get("serving_sizes") or [{}]
+        first = servings[0]
+        energy = (food.get("nutritional_contents") or {}).get("energy") or {}
+        calories = energy.get("value")
+        if calories is not None and first.get("nutrition_multiplier") is not None:
+            calories = round(calories * first["nutrition_multiplier"], 1)
+        results.append({
+            "name": food.get("description", ""),
+            "brand": food.get("brand_name") or "",
+            "serving": f"{first.get('value', '')} {first.get('unit', '')}".strip(),
+            "calories": calories,
+            "mfp_id": str(food["id"]),
+        })
+    return results[:limit]
+
+
 def select_serving_size(food: Dict[str, Any], unit: Optional[str] = None) -> Dict[str, Any]:
     """
     Choose which of a food's serving sizes to log against.
@@ -1974,23 +2014,8 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
     """
     try:
         client = get_mfp_client()
-        results = client.get_food_search_results(params.query)
-
-        # Limit results
-        results = results[: params.limit]
-
-        data = {"query": params.query, "count": len(results), "results": []}
-
-        for item in results:
-            data["results"].append(
-                {
-                    "name": item.name,
-                    "brand": item.brand,
-                    "serving": item.serving,
-                    "calories": item.calories,
-                    "mfp_id": item.mfp_id,
-                }
-            )
+        results = search_foods_v2(client, params.query, params.limit)
+        data = {"query": params.query, "count": len(results), "results": results}
 
         return format_response(
             data, params.response_format, f"Food Search Results for '{params.query}'"
